@@ -17,7 +17,9 @@ from frappe.desk.form.assign_to import add as assign_to
 from frappe.model.document import Document
 from frappe.utils import (
 	add_days,
+	add_months,
 	cstr,
+	flt,
 	get_first_day,
 	get_last_day,
 	getdate,
@@ -52,9 +54,13 @@ class AutoRepeat(Document):
 		from frappe.automation.doctype.auto_repeat_user.auto_repeat_user import AutoRepeatUser
 		from frappe.types import DF
 
+		apply_pricing_rules: DF.Check
 		assignee: DF.TableMultiSelect[AutoRepeatUser]
+		auto_submit_reversal: DF.Check
+		current_source_document: DF.DynamicLink | None
 		disabled: DF.Check
 		end_date: DF.Date | None
+		follow_amendment_chain: DF.Check
 		frequency: DF.Literal[
 			"", "Daily", "Weekly", "Fortnightly", "Monthly", "Quarterly", "Half-yearly", "Yearly"
 		]
@@ -63,12 +69,29 @@ class AutoRepeat(Document):
 		next_schedule_date: DF.Date | None
 		notify_by_email: DF.Check
 		print_format: DF.Link | None
+		recalculate_payment_terms: DF.Check
+		recalculate_taxes: DF.Check
 		recipients: DF.SmallText | None
 		reference_doctype: DF.Link
 		reference_document: DF.DynamicLink
+		refresh_exchange_rate: DF.Check
+		refresh_item_tax_template: DF.Check
+		refresh_mode: DF.Literal["Copy Original", "Recalculate"]
+		refresh_prices: DF.Check
+		refresh_purchase_tax_template: DF.Check
+		refresh_sales_tax_template: DF.Check
+		refresh_shipping_rule: DF.Check
 		repeat_on_day: DF.Int
 		repeat_on_days: DF.Table[AutoRepeatDay]
 		repeat_on_last_day: DF.Check
+		repeat_type: DF.Literal["Copy", "Reversal"]
+		respect_cost_center_allocation: DF.Check
+		reversal_cost_center_mode: DF.Literal["Use Original", "Apply Current Allocation"]
+		reversal_exchange_rate_type: DF.Literal["Original Rate", "Current Rate"]
+		reversal_tax_mode: DF.Literal["Use Original", "Recalculate for Posting Date"]
+		reverse_date: DF.Date | None
+		reverse_on_next_month: DF.Check
+		skip_if_source_cancelled: DF.Check
 		start_date: DF.Date
 		status: DF.Literal["", "Active", "Disabled", "Completed"]
 		subject: DF.Data | None
@@ -78,6 +101,7 @@ class AutoRepeat(Document):
 
 	def validate(self):
 		self.update_status()
+		self.validate_repeat_type()
 		self.validate_reference_doctype()
 		self.validate_submit_on_creation()
 		self.validate_dates()
@@ -89,6 +113,9 @@ class AutoRepeat(Document):
 
 		validate_template(self.subject or "")
 		validate_template(self.message or "")
+
+	def before_save(self):
+		self.warn_on_non_true_reversal()
 
 	def before_insert(self):
 		if not frappe.in_test:
@@ -106,10 +133,20 @@ class AutoRepeat(Document):
 	def set_dates(self):
 		if self.disabled:
 			self.next_schedule_date = None
-		else:
-			self.next_schedule_date = self.get_next_schedule_date(schedule_date=self.start_date)
-			if self.end_date and getdate(self.end_date) < getdate(self.next_schedule_date):
-				frappe.throw(_("The Next Scheduled Date cannot be later than the End Date."))
+			return
+
+		if self.repeat_type == "Reversal":
+			# Reversal mode is single-execution; next_schedule_date is the configured reversal date
+			# so the existing scheduler dispatch path picks it up on the right day.
+			if self.reverse_on_next_month:
+				self.next_schedule_date = get_first_day(add_months(getdate(), 1))
+			elif self.reverse_date:
+				self.next_schedule_date = getdate(self.reverse_date)
+			return
+
+		self.next_schedule_date = self.get_next_schedule_date(schedule_date=self.start_date)
+		if self.end_date and getdate(self.end_date) < getdate(self.next_schedule_date):
+			frappe.throw(_("The Next Scheduled Date cannot be later than the End Date."))
 
 	def unlink_if_applicable(self):
 		if self.status == "Completed" or self.disabled:
@@ -186,6 +223,10 @@ class AutoRepeat(Document):
 			frappe.db.set_value(self.reference_doctype, self.reference_document, "auto_repeat", self.name)
 
 	def update_status(self):
+		# A Reversal-mode AR that has finished its single execution sets disabled=1
+		# and status="Completed" directly via db_set; preserve that on the next save.
+		if self.repeat_type == "Reversal" and self.disabled and self.status == "Completed":
+			return
 		if self.disabled:
 			self.status = "Disabled"
 		elif self.is_completed():
@@ -255,7 +296,15 @@ class AutoRepeat(Document):
 		return docs
 
 	def make_new_document(self, assignee=None):
-		reference_doc = frappe.get_doc(self.reference_doctype, self.reference_document)
+		reference_doc = self.get_authoritative_source()
+		if reference_doc is None:
+			return self.handle_no_valid_source()
+
+		if self.repeat_type == "Reversal":
+			return self.make_reversal_document(reference_doc)
+		return self.make_copy_document(reference_doc, assignee)
+
+	def make_copy_document(self, reference_doc, assignee=None):
 		new_doc = frappe.copy_doc(reference_doc, ignore_no_copy=False)
 		self.update_doc(new_doc, reference_doc)
 		new_doc.flags.updater_reference = {
@@ -263,6 +312,27 @@ class AutoRepeat(Document):
 			"docname": self.name,
 			"label": _("via Auto Repeat"),
 		}
+
+		# Apply per-field refresh switches before insert
+		if self.refresh_prices:
+			self.refresh_item_prices(new_doc)
+		if self.refresh_exchange_rate:
+			self.refresh_conversion_rate(new_doc)
+		if self.refresh_sales_tax_template:
+			self.refresh_sales_tax_template_for(new_doc)
+		if self.refresh_purchase_tax_template:
+			self.refresh_purchase_tax_template_for(new_doc)
+		if self.refresh_item_tax_template:
+			self.refresh_item_tax_template_for(new_doc)
+		if self.refresh_shipping_rule:
+			self.refresh_shipping_rule_for(new_doc)
+		if self.recalculate_taxes:
+			self.recalculate_document_taxes(new_doc)
+		if self.recalculate_payment_terms:
+			self.recalculate_payment_schedule(new_doc)
+		if self.respect_cost_center_allocation:
+			self.apply_cost_center_allocation(new_doc)
+
 		new_doc.insert(ignore_permissions=True)
 		if assignee:
 			args = {
@@ -491,6 +561,585 @@ class AutoRepeat(Document):
 			args={"auto_repeat_failed_for": auto_repeat_failed_for, "error_log_message": error_log_message},
 			header=[subject, "red"],
 		)
+
+	# ──────────────────────────────────────────────────────────────────────
+	# WP GA-0001-05+06 — Repeat Type validation, source resolution, refresh,
+	# and reversal helpers.
+	# ──────────────────────────────────────────────────────────────────────
+
+	def validate_repeat_type(self):
+		if self.repeat_type != "Reversal":
+			return
+
+		if self.reference_doctype != "Journal Entry":
+			frappe.throw(_("Reversal mode is only supported for Journal Entry"))
+
+		if not frappe.db.exists("DocType", "Journal Entry"):
+			# Frappe-only site without ERPNext — Reversal cannot work
+			frappe.throw(_("Reversal mode requires the ERPNext app (Journal Entry doctype not found)"))
+
+		if not (self.reverse_on_next_month or self.reverse_date):
+			frappe.throw(
+				_(
+					"Reversal mode requires either 'Reverse on First Day of Next Month' "
+					"or a specific 'Reversal Date'"
+				)
+			)
+
+	def warn_on_non_true_reversal(self):
+		"""Surface a warning when Reversal-mode settings break true-reversal semantics.
+
+		These choices are legitimate for adjustment scenarios (revaluation, restatement),
+		but break the perfect-offset property required for immutable-ledger compliance.
+		Warn — do not throw.
+		"""
+		if self.repeat_type != "Reversal":
+			return
+		warnings = []
+		if self.reversal_exchange_rate_type == "Current Rate":
+			warnings.append(
+				_(
+					"Using 'Current Rate' for the reversal will create an FX gain/loss "
+					"instead of a perfect offset of the original entry."
+				)
+			)
+		if self.reversal_tax_mode == "Recalculate for Posting Date":
+			warnings.append(
+				_(
+					"Recalculating taxes on the reversal posting date breaks immutable-ledger "
+					"compliance for true reversals — only enable for adjustment scenarios."
+				)
+			)
+		if self.reversal_cost_center_mode == "Apply Current Allocation":
+			warnings.append(
+				_(
+					"Applying current Cost Center Allocation rules to the reversal breaks "
+					"immutable-ledger compliance for true reversals."
+				)
+			)
+		if warnings:
+			frappe.msgprint(
+				"<br>".join(warnings),
+				title=_("Reversal Configuration Warning"),
+				indicator="orange",
+			)
+
+	def get_authoritative_source(self):
+		"""Resolve the source document, following the amendment chain when configured.
+
+		Returns the live source doc, or None when the source is cancelled and either
+		(a) follow_amendment_chain=0, or (b) no non-cancelled amendment exists.
+		"""
+		reference_doc = frappe.get_doc(self.reference_doctype, self.reference_document)
+
+		if hasattr(reference_doc, "docstatus") and reference_doc.docstatus == 2:
+			if self.follow_amendment_chain:
+				latest = self.find_latest_amendment(reference_doc)
+				if latest:
+					self.db_set("current_source_document", latest.name)
+					return latest
+			return None
+
+		self.db_set("current_source_document", reference_doc.name)
+		return reference_doc
+
+	def find_latest_amendment(self, cancelled_doc):
+		"""Walk the amended_from chain and return the latest non-cancelled successor."""
+		amended = frappe.db.get_value(
+			self.reference_doctype,
+			{"amended_from": cancelled_doc.name, "docstatus": ["!=", 2]},
+			["name"],
+			as_dict=True,
+		)
+		if not amended:
+			return None
+		doc = frappe.get_doc(self.reference_doctype, amended.name)
+		if doc.docstatus == 2:
+			return self.find_latest_amendment(doc)
+		return doc
+
+	def handle_no_valid_source(self):
+		"""Source is cancelled with no valid amendment — skip-and-disable, or throw."""
+		msg = (
+			f"Auto Repeat {self.name}: source {self.reference_document} is cancelled "
+			f"and no valid amendment was found."
+		)
+		if self.skip_if_source_cancelled:
+			frappe.log_error(title="Auto Repeat Skipped", message=msg)
+			self.db_set("disabled", 1)
+			self.db_set("status", "Disabled")
+			if self.notify_by_email and self.recipients:
+				try:
+					self.send_skip_notification()
+				except Exception:
+					frappe.log_error(title="Auto Repeat Skip Notification Failed", message=msg)
+			return None
+		frappe.throw(
+			_("Cannot create document: source {0} is cancelled and no valid amendment found").format(
+				self.reference_document
+			)
+		)
+
+	def send_skip_notification(self):
+		"""Notify recipients that an Auto Repeat run was skipped due to a cancelled source."""
+		if not (self.notify_by_email and self.recipients):
+			return
+		subject = _("Auto Repeat Skipped: source cancelled — {0}").format(self.name)
+		message = _(
+			"Auto Repeat <b>{0}</b> was skipped because the source document <b>{1}</b> "
+			"is cancelled and no valid amendment was found. The Auto Repeat has been disabled."
+		).format(self.name, self.reference_document)
+		make(
+			doctype=self.doctype,
+			name=self.name,
+			recipients=self.recipients,
+			subject=subject,
+			content=message,
+			send_email=1,
+		)
+
+	# ── Copy-mode refresh helpers ─────────────────────────────────────────
+
+	def refresh_item_prices(self, new_doc):
+		"""Refresh item rates / price-list rates from the latest Price List."""
+		try:
+			from erpnext.stock.get_item_details import get_item_details
+		except ImportError:
+			frappe.log_error(
+				title="Auto Repeat Refresh Skipped",
+				message=f"Auto Repeat {self.name}: refresh_prices requires ERPNext.",
+			)
+			return
+		if not new_doc.get("items"):
+			return
+		posting_date = new_doc.get("posting_date") or new_doc.get("transaction_date") or getdate()
+		price_list = new_doc.get("selling_price_list") or new_doc.get("buying_price_list")
+		currency = new_doc.get("currency") or new_doc.get("price_list_currency")
+		party_field = "customer" if new_doc.get("customer") else ("supplier" if new_doc.get("supplier") else None)
+		party = new_doc.get(party_field) if party_field else None
+		for item in new_doc.get("items", []):
+			if not item.item_code:
+				continue
+			ctx = frappe._dict(
+				{
+					"item_code": item.item_code,
+					"company": new_doc.get("company"),
+					"doctype": new_doc.doctype,
+					"posting_date": posting_date,
+					"transaction_date": posting_date,
+					"price_list": price_list,
+					"price_list_currency": currency,
+					"currency": currency,
+					"qty": item.qty or 1,
+					"uom": item.uom,
+					"customer": new_doc.get("customer"),
+					"supplier": new_doc.get("supplier"),
+					"warehouse": item.get("warehouse"),
+					"conversion_rate": new_doc.get("conversion_rate") or 1,
+					"plc_conversion_rate": new_doc.get("plc_conversion_rate") or 1,
+					"ignore_pricing_rule": 0 if self.apply_pricing_rules else 1,
+					"transaction_type": "selling" if party_field == "customer" else "buying",
+				}
+			)
+			try:
+				details = get_item_details(ctx)
+				if details.get("price_list_rate") is not None:
+					item.price_list_rate = flt(details.price_list_rate)
+				if details.get("rate") is not None:
+					item.rate = flt(details.rate)
+				if details.get("discount_percentage") is not None:
+					item.discount_percentage = flt(details.discount_percentage)
+			except Exception as e:
+				frappe.log_error(
+					title="Auto Repeat Price Refresh Failed",
+					message=f"Auto Repeat {self.name}: row {item.idx} ({item.item_code}) — {e}",
+				)
+
+	def refresh_conversion_rate(self, new_doc):
+		"""Refresh conversion_rate using the FX rate at the new posting date."""
+		try:
+			from erpnext.setup.utils import get_exchange_rate
+		except ImportError:
+			frappe.log_error(
+				title="Auto Repeat Refresh Skipped",
+				message=f"Auto Repeat {self.name}: refresh_exchange_rate requires ERPNext.",
+			)
+			return
+		if not new_doc.get("currency") or not new_doc.get("company"):
+			return
+		company_currency = frappe.get_cached_value("Company", new_doc.company, "default_currency")
+		if new_doc.currency == company_currency:
+			return
+		posting_date = new_doc.get("posting_date") or new_doc.get("transaction_date") or getdate()
+		try:
+			rate = get_exchange_rate(new_doc.currency, company_currency, posting_date)
+		except Exception as e:
+			frappe.log_error(
+				title="Auto Repeat FX Refresh Failed",
+				message=f"Auto Repeat {self.name}: {e}",
+			)
+			return
+		if rate:
+			new_doc.conversion_rate = flt(rate)
+			if new_doc.meta.has_field("plc_conversion_rate"):
+				new_doc.plc_conversion_rate = flt(rate)
+
+	def refresh_sales_tax_template_for(self, new_doc):
+		applicable = ("Sales Invoice", "Sales Order", "Quotation", "Delivery Note")
+		if new_doc.doctype not in applicable:
+			return
+		template = None
+		if new_doc.get("customer"):
+			template = frappe.db.get_value("Customer", new_doc.customer, "default_taxes_and_charges")
+		if not template and new_doc.get("company"):
+			template = frappe.db.get_value(
+				"Sales Taxes and Charges Template",
+				{"company": new_doc.company, "is_default": 1, "disabled": 0},
+				"name",
+			)
+		self._apply_taxes_template(new_doc, template)
+
+	def refresh_purchase_tax_template_for(self, new_doc):
+		applicable = ("Purchase Invoice", "Purchase Order", "Purchase Receipt")
+		if new_doc.doctype not in applicable:
+			return
+		template = None
+		if new_doc.get("supplier"):
+			template = frappe.db.get_value("Supplier", new_doc.supplier, "default_taxes_and_charges")
+		if not template and new_doc.get("company"):
+			template = frappe.db.get_value(
+				"Purchase Taxes and Charges Template",
+				{"company": new_doc.company, "is_default": 1, "disabled": 0},
+				"name",
+			)
+		self._apply_taxes_template(new_doc, template)
+
+	def _apply_taxes_template(self, new_doc, template):
+		if not template or new_doc.get("taxes_and_charges") == template:
+			return
+		new_doc.taxes_and_charges = template
+		# Reset taxes table; controller's calculate_taxes_and_totals/get_taxes
+		# will repopulate from the template at insert/save time.
+		new_doc.set("taxes", [])
+		try:
+			tax_rows = frappe.get_all(
+				"Sales Taxes and Charges"
+				if new_doc.doctype in ("Sales Invoice", "Sales Order", "Quotation", "Delivery Note")
+				else "Purchase Taxes and Charges",
+				filters={"parent": template},
+				fields="*",
+				order_by="idx asc",
+			)
+			for row in tax_rows:
+				row.pop("name", None)
+				row.pop("parent", None)
+				row.pop("parenttype", None)
+				row.pop("parentfield", None)
+				new_doc.append("taxes", row)
+		except Exception as e:
+			frappe.log_error(
+				title="Auto Repeat Tax Template Refresh Failed",
+				message=f"Auto Repeat {self.name}: template {template} — {e}",
+			)
+
+	def refresh_item_tax_template_for(self, new_doc):
+		"""Re-derive each item row's Item Tax Template from the Item master.
+
+		Respects valid_from <= posting_date — see WP §4.2 GAP-027.
+		Clears stale per-item exemptions when the Item master no longer has
+		an applicable template.
+		"""
+		if not new_doc.get("items"):
+			return
+		posting_date = new_doc.get("posting_date") or new_doc.get("transaction_date") or getdate()
+		for item in new_doc.get("items", []):
+			if not item.item_code:
+				continue
+			applicable = frappe.get_all(
+				"Item Tax",
+				filters={
+					"parent": item.item_code,
+					"parenttype": "Item",
+					"valid_from": ["<=", posting_date],
+				},
+				fields=["item_tax_template"],
+				order_by="valid_from desc",
+				limit=1,
+			)
+			item.item_tax_template = applicable[0].item_tax_template if applicable else None
+
+	def refresh_shipping_rule_for(self, new_doc):
+		applicable = ("Sales Invoice", "Sales Order", "Delivery Note", "Quotation")
+		if new_doc.doctype not in applicable or not new_doc.get("shipping_rule"):
+			return
+		try:
+			rule = frappe.get_doc("Shipping Rule", new_doc.shipping_rule)
+			rule.apply(new_doc)
+		except Exception as e:
+			frappe.log_error(
+				title="Auto Repeat Shipping Rule Refresh Failed",
+				message=f"Auto Repeat {self.name}: rule {new_doc.shipping_rule} — {e}",
+			)
+
+	def recalculate_document_taxes(self, new_doc):
+		if hasattr(new_doc, "calculate_taxes_and_totals"):
+			try:
+				new_doc.calculate_taxes_and_totals()
+			except Exception as e:
+				frappe.log_error(
+					title="Auto Repeat Tax Recalc Failed",
+					message=f"Auto Repeat {self.name}: {e}",
+				)
+		else:
+			frappe.log_error(
+				title="Auto Repeat Tax Recalc Skipped",
+				message=f"Auto Repeat {self.name}: {new_doc.doctype} has no calculate_taxes_and_totals().",
+			)
+
+	def recalculate_payment_schedule(self, new_doc):
+		if hasattr(new_doc, "set_payment_schedule"):
+			try:
+				new_doc.set_payment_schedule()
+			except Exception as e:
+				frappe.log_error(
+					title="Auto Repeat Payment Schedule Recalc Failed",
+					message=f"Auto Repeat {self.name}: {e}",
+				)
+
+	def apply_cost_center_allocation(self, new_doc):
+		"""Audit Cost Center Allocation rules for the new posting date.
+
+		Document-level cost centers are NOT mutated; the GL distribution that ERPNext
+		performs in general_ledger.distribute_gl_based_on_cost_center_allocation() at
+		posting time uses the new posting date directly. We log an audit row whenever
+		a row's cost center has any allocation valid for the new posting date so the
+		operator can verify the resulting split.
+		"""
+		try:
+			from erpnext.accounts.general_ledger import get_cost_center_allocation_data
+		except ImportError:
+			return
+		company = new_doc.get("company")
+		posting_date = new_doc.get("posting_date") or new_doc.get("transaction_date") or getdate()
+		if not company:
+			return
+		rows = []
+		if new_doc.get("items"):
+			rows.extend(new_doc.get("items"))
+		if new_doc.get("accounts"):
+			rows.extend(new_doc.get("accounts"))
+		seen = set()
+		for row in rows:
+			cc = row.get("cost_center")
+			if not cc or cc in seen:
+				continue
+			seen.add(cc)
+			try:
+				allocation = get_cost_center_allocation_data(company, posting_date, cc)
+			except Exception:
+				continue
+			if allocation:
+				frappe.log_error(
+					title="Auto Repeat Cost Center Allocation",
+					message=(
+						f"Auto Repeat {self.name}: cost center {cc} has allocation rules "
+						f"valid for {posting_date}. GL distribution will apply at posting time."
+					),
+				)
+
+	# ── Reversal-mode helpers ─────────────────────────────────────────────
+
+	def make_reversal_document(self, reference_doc):
+		"""Create a reversal Journal Entry from the source via ERPNext's existing helper.
+
+		Single-execution: the Auto Repeat is disabled after one successful insert,
+		regardless of whether auto_submit_reversal succeeded.
+		"""
+		try:
+			from erpnext.accounts.doctype.journal_entry.journal_entry import (
+				make_reverse_journal_entry,
+			)
+		except ImportError:
+			frappe.throw(_("Reversal mode requires the ERPNext app to be installed"))
+
+		# GA-0001-01 already exposes is_reversed on the source; if the source has been
+		# reversed by hand (or by a previous AR run), we never recurse — log + disable.
+		if getattr(reference_doc, "is_reversed", 0):
+			frappe.log_error(
+				title="Auto Repeat Skipped",
+				message=f"Auto Repeat {self.name}: source {reference_doc.name} already reversed.",
+			)
+			self.db_set("disabled", 1)
+			self.db_set("status", "Completed")
+			if reference_doc.doctype == "Journal Entry" and reference_doc.meta.has_field(
+				"auto_reversal_status"
+			):
+				frappe.db.set_value(
+					"Journal Entry", reference_doc.name, "auto_reversal_status", "Cancelled"
+				)
+			return None
+
+		reversal = make_reverse_journal_entry(reference_doc.name)
+
+		# Schedule
+		if self.reverse_on_next_month:
+			reversal.posting_date = get_first_day(add_months(getdate(), 1))
+		elif self.reverse_date:
+			reversal.posting_date = getdate(self.reverse_date)
+
+		# WP GAP-013/014 — make_reverse_journal_entry does not copy cost_center / party / project.
+		self.enhance_reversal_mapping(reversal, reference_doc)
+
+		# WP GAP-021 / Phase 5.1 — FX handling
+		if self.reversal_exchange_rate_type == "Current Rate":
+			self.refresh_reversal_exchange_rate(reversal, reference_doc)
+
+		# WP GAP-022 — cost-center allocation audit
+		if self.reversal_cost_center_mode == "Apply Current Allocation":
+			self.apply_reversal_cost_center_allocation(reversal)
+
+		# WP GAP-021 — tax recalculation (audit-only — see imp plan §6 sign-off #4)
+		if self.reversal_tax_mode == "Recalculate for Posting Date":
+			self.recalculate_reversal_taxes(reversal)
+
+		reversal.user_remark = (reversal.user_remark or "") + (
+			f"\nAuto-created by Auto Repeat {self.name}".strip()
+		)
+		reversal.flags.ignore_permissions = True
+		reversal.flags.updater_reference = {
+			"doctype": self.doctype,
+			"docname": self.name,
+			"label": _("via Auto Repeat (Reversal)"),
+		}
+		reversal.insert()
+
+		# Wire the JE-side status fields if ERPNext has them (added by GA-0001-05+06 ERPNext PR)
+		je_meta = frappe.get_meta("Journal Entry")
+		updates = {}
+		if je_meta.has_field("linked_auto_repeat"):
+			updates["linked_auto_repeat"] = self.name
+		if je_meta.has_field("auto_reversal_status"):
+			updates["auto_reversal_status"] = "Scheduled"
+		if updates:
+			frappe.db.set_value("Journal Entry", reference_doc.name, updates)
+
+		if self.auto_submit_reversal:
+			try:
+				reversal.submit()
+				if je_meta.has_field("auto_reversal_status"):
+					frappe.db.set_value(
+						"Journal Entry", reference_doc.name, "auto_reversal_status", "Completed"
+					)
+			except Exception:
+				if je_meta.has_field("auto_reversal_status"):
+					frappe.db.set_value(
+						"Journal Entry", reference_doc.name, "auto_reversal_status", "Failed"
+					)
+				raise
+
+		# Single-execution semantics — disable after first successful insert
+		self.db_set("disabled", 1)
+		self.db_set("status", "Completed")
+		return reversal
+
+	def enhance_reversal_mapping(self, reversal, original):
+		"""Copy cost_center / party / project / user_remark per-row.
+
+		make_reverse_journal_entry's field_map only swaps debit ↔ credit; everything
+		else needs explicit copying. We pair rows positionally because the field_map
+		preserves row order.
+		"""
+		for i, row in enumerate(reversal.accounts):
+			if i >= len(original.accounts):
+				break
+			orig = original.accounts[i]
+			row.cost_center = orig.get("cost_center")
+			row.project = orig.get("project")
+			row.party_type = orig.get("party_type")
+			row.party = orig.get("party")
+			if not row.user_remark and orig.get("user_remark"):
+				row.user_remark = orig.user_remark
+
+	def refresh_reversal_exchange_rate(self, reversal, original):
+		"""Revalue the reversal at the FX rate of the reversal posting date.
+
+		Breaks immutable-ledger compliance — the operator was warned at save time.
+		"""
+		try:
+			from erpnext.setup.utils import get_exchange_rate
+		except ImportError:
+			return
+		if not getattr(reversal, "multi_currency", 0):
+			return
+		posting_date = reversal.posting_date or getdate()
+		company_currency = frappe.get_cached_value(
+			"Company", reversal.company, "default_currency"
+		)
+		for row in reversal.accounts:
+			if row.account_currency and row.account_currency != company_currency:
+				try:
+					new_rate = get_exchange_rate(
+						row.account_currency, company_currency, posting_date
+					)
+				except Exception:
+					continue
+				if new_rate:
+					row.exchange_rate = flt(new_rate)
+					row.debit = flt(row.debit_in_account_currency) * flt(new_rate)
+					row.credit = flt(row.credit_in_account_currency) * flt(new_rate)
+		if hasattr(reversal, "set_total_debit_credit"):
+			reversal.set_total_debit_credit()
+
+	def apply_reversal_cost_center_allocation(self, reversal):
+		"""Audit Cost Center Allocation rules for the reversal posting date."""
+		try:
+			from erpnext.accounts.general_ledger import get_cost_center_allocation_data
+		except ImportError:
+			return
+		posting_date = reversal.posting_date or getdate()
+		company = reversal.company
+		seen = set()
+		for row in reversal.accounts:
+			if not row.cost_center or row.cost_center in seen:
+				continue
+			seen.add(row.cost_center)
+			try:
+				allocation = get_cost_center_allocation_data(
+					company, posting_date, row.cost_center
+				)
+			except Exception:
+				continue
+			if allocation:
+				frappe.log_error(
+					title="Auto Repeat Reversal Cost Center Allocation",
+					message=(
+						f"Auto Repeat {self.name}: reversal cost center {row.cost_center} "
+						f"has allocation rules for {posting_date}. "
+						f"GL distribution will apply at posting time: {allocation}"
+					),
+				)
+
+	def recalculate_reversal_taxes(self, reversal):
+		"""Audit-log per-tax-account when 'Recalculate for Posting Date' is selected.
+
+		Per WP §4.2 GAP-021 (status CLOSED) and imp-plan sign-off #4: actual amount
+		recomputation on a JE reversal is genuinely complex and is deferred. The
+		setting exists for the audit trail; we record a log row per tax account so
+		Finance can review whether manual adjustment is needed.
+		"""
+		for row in reversal.accounts:
+			if not row.account:
+				continue
+			account_type = frappe.get_cached_value("Account", row.account, "account_type")
+			if account_type == "Tax":
+				frappe.log_error(
+					title="Auto Repeat Reversal Tax Note",
+					message=(
+						f"Auto Repeat {self.name}: tax account {row.account} on the reversal "
+						f"keeps the original amount. If tax rates changed between the original "
+						f"and reversal posting dates, manual adjustment may be required."
+					),
+				)
 
 
 def get_next_date(dt, mcount, day=None):
