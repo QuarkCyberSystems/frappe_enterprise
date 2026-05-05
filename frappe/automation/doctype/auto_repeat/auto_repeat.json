@@ -10,11 +10,17 @@
  "field_order": [
   "reference_doctype",
   "reference_document",
+  "repeat_type",
   "submit_on_creation",
   "column_break_5",
   "start_date",
   "end_date",
   "disabled",
+  "source_validation_section",
+  "skip_if_source_cancelled",
+  "follow_amendment_chain",
+  "column_break_source",
+  "current_source_document",
   "section_break_10",
   "frequency",
   "repeat_on_day",
@@ -26,6 +32,27 @@
   "assignee",
   "section_break_16",
   "repeat_on_days",
+  "copy_options_section",
+  "refresh_mode",
+  "refresh_prices",
+  "apply_pricing_rules",
+  "refresh_exchange_rate",
+  "column_break_copy",
+  "recalculate_taxes",
+  "recalculate_payment_terms",
+  "respect_cost_center_allocation",
+  "refresh_sales_tax_template",
+  "refresh_purchase_tax_template",
+  "refresh_item_tax_template",
+  "refresh_shipping_rule",
+  "reversal_section",
+  "reverse_on_next_month",
+  "reverse_date",
+  "column_break_reversal",
+  "auto_submit_reversal",
+  "reversal_exchange_rate_type",
+  "reversal_tax_mode",
+  "reversal_cost_center_mode",
   "notification",
   "notify_by_email",
   "recipients",
@@ -55,6 +82,16 @@
    "reqd": 1
   },
   {
+   "default": "Copy",
+   "description": "Copy: Creates duplicate documents on a recurring schedule. Reversal: Creates a single reversal entry on a scheduled date (Journal Entry only).",
+   "fieldname": "repeat_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Repeat Type",
+   "options": "Copy\nReversal",
+   "reqd": 1
+  },
+  {
    "fieldname": "column_break_5",
    "fieldtype": "Column Break"
   },
@@ -80,6 +117,39 @@
    "no_copy": 1
   },
   {
+   "fieldname": "source_validation_section",
+   "fieldtype": "Section Break",
+   "label": "Source Validation"
+  },
+  {
+   "default": "1",
+   "description": "Skip and disable this Auto Repeat if the source document is cancelled and no valid amendment is found.",
+   "fieldname": "skip_if_source_cancelled",
+   "fieldtype": "Check",
+   "label": "Skip if Source Cancelled"
+  },
+  {
+   "default": "1",
+   "description": "If the source is cancelled, follow the amendment chain (amended_from) and use the latest non-cancelled version as the authoritative source.",
+   "fieldname": "follow_amendment_chain",
+   "fieldtype": "Check",
+   "label": "Follow Amendment Chain"
+  },
+  {
+   "fieldname": "column_break_source",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Latest authoritative source resolved on the last run. Updated automatically when the amendment chain is followed.",
+   "fieldname": "current_source_document",
+   "fieldtype": "Dynamic Link",
+   "label": "Current Source Document",
+   "no_copy": 1,
+   "options": "reference_doctype",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.repeat_type !== 'Reversal'",
    "fieldname": "section_break_10",
    "fieldtype": "Tab Break",
    "label": "Schedule"
@@ -89,8 +159,8 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Frequency",
-   "options": "\nDaily\nWeekly\nFortnightly\nMonthly\nQuarterly\nHalf-yearly\nYearly",
-   "reqd": 1
+   "mandatory_depends_on": "eval:doc.repeat_type !== 'Reversal'",
+   "options": "\nDaily\nWeekly\nFortnightly\nMonthly\nQuarterly\nHalf-yearly\nYearly"
   },
   {
    "fieldname": "column_break_12",
@@ -217,10 +287,155 @@
    "fieldtype": "Table MultiSelect",
    "label": "Assignee",
    "options": "Auto Repeat User"
+  },
+  {
+   "depends_on": "eval:doc.repeat_type == 'Copy'",
+   "fieldname": "copy_options_section",
+   "fieldtype": "Tab Break",
+   "label": "Copy Options"
+  },
+  {
+   "default": "Copy Original",
+   "description": "Copy Original: All values copied as-is from source. Recalculate: Refreshes prices, FX, taxes, payment terms, shipping, and cost-center allocation for the new posting date. Switching to Recalculate auto-enables every individual switch below; switch them off again for fine-grained control.",
+   "fieldname": "refresh_mode",
+   "fieldtype": "Select",
+   "label": "Refresh Mode",
+   "options": "Copy Original\nRecalculate"
+  },
+  {
+   "default": "0",
+   "description": "Refresh item rates and price-list rates from the latest Price List for the new posting date.",
+   "fieldname": "refresh_prices",
+   "fieldtype": "Check",
+   "label": "Refresh Prices from Price List"
+  },
+  {
+   "default": "0",
+   "depends_on": "eval:doc.refresh_prices",
+   "description": "Re-evaluate Pricing Rules against the new doc state during price refresh.",
+   "fieldname": "apply_pricing_rules",
+   "fieldtype": "Check",
+   "label": "Apply Pricing Rules"
+  },
+  {
+   "default": "0",
+   "description": "Refresh the document conversion_rate and recompute base amounts using the FX rate valid for the new posting date.",
+   "fieldname": "refresh_exchange_rate",
+   "fieldtype": "Check",
+   "label": "Refresh Exchange Rate"
+  },
+  {
+   "fieldname": "column_break_copy",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "description": "Recalculate tax amounts based on the new posting date's tax rules.",
+   "fieldname": "recalculate_taxes",
+   "fieldtype": "Check",
+   "label": "Recalculate Taxes"
+  },
+  {
+   "default": "0",
+   "description": "Recompute the payment schedule against the new posting date and current Payment Terms Template.",
+   "fieldname": "recalculate_payment_terms",
+   "fieldtype": "Check",
+   "label": "Recalculate Payment Terms"
+  },
+  {
+   "default": "1",
+   "description": "Audit and apply Cost Center Allocation rules valid for the new posting date. Document-level cost center is unchanged; GL distribution is performed at posting time.",
+   "fieldname": "respect_cost_center_allocation",
+   "fieldtype": "Check",
+   "label": "Respect Cost Center Allocation"
+  },
+  {
+   "default": "0",
+   "description": "Fetch the current default Sales Taxes and Charges Template for the customer/company and re-populate the taxes table. Applies to Sales Invoice, Sales Order, Quotation, Delivery Note.",
+   "fieldname": "refresh_sales_tax_template",
+   "fieldtype": "Check",
+   "label": "Refresh Sales Tax Template"
+  },
+  {
+   "default": "0",
+   "description": "Fetch the current default Purchase Taxes and Charges Template for the supplier/company and re-populate the taxes table. Applies to Purchase Invoice, Purchase Order, Purchase Receipt.",
+   "fieldname": "refresh_purchase_tax_template",
+   "fieldtype": "Check",
+   "label": "Refresh Purchase Tax Template"
+  },
+  {
+   "default": "0",
+   "description": "Re-derive each item row's Item Tax Template from the Item master, respecting valid_from <= posting_date. Clears stale per-item exemptions when the Item master no longer has a matching template.",
+   "fieldname": "refresh_item_tax_template",
+   "fieldtype": "Check",
+   "label": "Refresh Item Tax Template"
+  },
+  {
+   "default": "0",
+   "description": "Re-apply the linked Shipping Rule against the new doc state so charges reflect current rates and conditions (weight, value, destination).",
+   "fieldname": "refresh_shipping_rule",
+   "fieldtype": "Check",
+   "label": "Refresh Shipping Rule"
+  },
+  {
+   "depends_on": "eval:doc.repeat_type == 'Reversal'",
+   "fieldname": "reversal_section",
+   "fieldtype": "Tab Break",
+   "label": "Reversal Options"
+  },
+  {
+   "default": "1",
+   "description": "Schedule the reversal for the first day of the month following today. Overrides Reversal Date when checked.",
+   "fieldname": "reverse_on_next_month",
+   "fieldtype": "Check",
+   "label": "Reverse on First Day of Next Month"
+  },
+  {
+   "depends_on": "eval:!doc.reverse_on_next_month",
+   "description": "Specific date on which the reversal should be created.",
+   "fieldname": "reverse_date",
+   "fieldtype": "Date",
+   "label": "Reversal Date",
+   "mandatory_depends_on": "eval:doc.repeat_type == 'Reversal' && !doc.reverse_on_next_month"
+  },
+  {
+   "fieldname": "column_break_reversal",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "description": "Submit the generated reversal Journal Entry automatically. Leave off to create as draft for review.",
+   "fieldname": "auto_submit_reversal",
+   "fieldtype": "Check",
+   "label": "Auto Submit Reversal"
+  },
+  {
+   "default": "Original Rate",
+   "description": "Original Rate: perfect offset (recommended for immutable ledger). Current Rate: revalues using the FX rate at the reversal posting date — creates an FX gain/loss.",
+   "fieldname": "reversal_exchange_rate_type",
+   "fieldtype": "Select",
+   "label": "Exchange Rate for Reversal",
+   "options": "Original Rate\nCurrent Rate"
+  },
+  {
+   "default": "Use Original",
+   "description": "Use Original: reverse exact tax amounts (true reversal). Recalculate for Posting Date: log per-tax-account audit notes for review when current rates differ from the original.",
+   "fieldname": "reversal_tax_mode",
+   "fieldtype": "Select",
+   "label": "Reversal Tax Mode",
+   "options": "Use Original\nRecalculate for Posting Date"
+  },
+  {
+   "default": "Use Original",
+   "description": "Use Original: same cost centers as the source. Apply Current Allocation: audit cost-center rows against current Cost Center Allocation rules for the reversal date.",
+   "fieldname": "reversal_cost_center_mode",
+   "fieldtype": "Select",
+   "label": "Reversal Cost Center Mode",
+   "options": "Use Original\nApply Current Allocation"
   }
  ],
  "links": [],
- "modified": "2025-06-09 18:20:23.775881",
+ "modified": "2026-05-05 13:30:00.000000",
  "modified_by": "Administrator",
  "module": "Automation",
  "name": "Auto Repeat",
