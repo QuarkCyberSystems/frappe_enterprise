@@ -1,5 +1,49 @@
 # Copyright (c) 2018, Frappe Technologies Pvt. Ltd. and contributors
 # License: MIT. See LICENSE
+"""Auto Repeat — recurring document creation, with two modes.
+
+Originally (pre-WP GA-0001-05+06): Auto Repeat had a single behaviour — on every
+schedule tick it deep-copied the source document via `frappe.copy_doc` and
+inserted the copy. The copy carried whatever was on the source verbatim.
+
+That behaviour is preserved as **Copy mode** (the default; existing Auto Repeats
+keep behaving byte-identically when all refresh switches are off). The WP added:
+
+1. **Source-validation handling** (GAP-001, GAP-009)
+   `skip_if_source_cancelled` + `follow_amendment_chain` resolve the source to
+   the latest non-cancelled version — see `get_authoritative_source` /
+   `find_latest_amendment`. When the source is cancelled with no valid amendment,
+   the AR self-disables, logs, and (optionally) emails recipients.
+
+2. **Copy-mode dynamic refresh** (GAP-002..008, GAP-019..020, GAP-024..027)
+   `refresh_mode` + per-field switches re-derive prices, FX rate, taxes, payment
+   schedule, sales/purchase/item tax templates, shipping rule, and cost-center
+   allocation for the new posting date. Each helper is bounded, idempotent, and
+   silently no-ops when the optional ERPNext dependency is missing.
+
+3. **Reversal mode** (GAP-012..015, GAP-021..023)
+   `repeat_type = "Reversal"` (Journal Entry only) hands off to ERPNext's
+   `make_reverse_journal_entry`, schedules for "first of next month" or a
+   specific date via the existing scheduler dispatch path, and disables itself
+   after a single execution. `reversal_exchange_rate_type`,
+   `reversal_tax_mode`, and `reversal_cost_center_mode` toggle Original-Rate
+   (true reversal, perfect offset) vs Current-Rate / Recalculate / Apply-Current
+   semantics for adjustment scenarios. Non-true-reversal choices are warned at
+   save time but never blocked.
+
+GAP-010 (`amended_from` cleared by `copy_doc`) is architecturally resolved:
+`get_authoritative_source` walks the amendment chain to the latest version
+*before* `copy_doc` runs, so the cleared `amended_from` on the new doc is the
+correct outcome — a recurring copy is not an amendment of the source.
+
+GAP-011 (immutable-ledger awareness) is surfaced as warnings on Reversal
+configurations that break true-reversal semantics (Current Rate, Recalculate
+Tax, Apply Current Allocation). The warnings are non-blocking — those choices
+are legitimate for adjustment / restatement scenarios.
+
+Full per-gap rationale: see `badia_docs/signed_off_wp/imp_ga-0001-05+06.md` in
+the originating implementation tree, or the upstream PR description.
+"""
 
 from datetime import timedelta
 
