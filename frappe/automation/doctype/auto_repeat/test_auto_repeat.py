@@ -279,6 +279,207 @@ class TestAutoRepeat(IntegrationTestCase):
 			sorted(["Administrator", "Guest"]),
 		)
 
+	# ──────────────────────────────────────────────────────────────────────
+	# WP GA-0001-05+06 — repeat_type / source-resolution / refresh-mode tests.
+	# Tests that require ERPNext (Journal Entry, Sales Invoice) live in
+	# apps/erpnext/erpnext/accounts/doctype/journal_entry/test_journal_entry.py.
+	# ──────────────────────────────────────────────────────────────────────
+
+	def test_repeat_type_default_is_copy(self):
+		"""TC-baseline: a freshly-created Auto Repeat defaults to Copy mode."""
+		todo = frappe.get_doc(
+			doctype="ToDo", description="repeat-type default test", assigned_by="Administrator"
+		).insert()
+		doc = make_auto_repeat(reference_document=todo.name)
+		self.assertEqual(doc.repeat_type, "Copy")
+
+	def test_validate_reversal_only_for_journal_entry(self):
+		"""TC-006: Reversal mode for non-JE doctype throws with the JE-only message."""
+		todo = frappe.get_doc(
+			doctype="ToDo", description="reversal-non-je test", assigned_by="Administrator"
+		).insert()
+		ar = frappe.get_doc(
+			{
+				"doctype": "Auto Repeat",
+				"reference_doctype": "ToDo",
+				"reference_document": todo.name,
+				"repeat_type": "Reversal",
+				"reverse_on_next_month": 1,
+				"start_date": today(),
+				"frequency": "",
+			}
+		)
+		with self.assertRaisesRegex(frappe.ValidationError, "Reversal mode is only supported"):
+			ar.insert(ignore_permissions=True)
+
+	def test_validate_reversal_requires_schedule(self):
+		"""TC-024: Reversal mode requires either reverse_on_next_month or reverse_date."""
+		if not frappe.db.exists("DocType", "Journal Entry"):
+			self.skipTest("Journal Entry doctype not available — Frappe-only site")
+		# Create a real submitted JE to point at — but that requires ERPNext setup.
+		# Sidestep by using a custom test-doctype renamed to simulate the validation gate;
+		# the gate itself only checks reference_doctype string and the schedule flags.
+		ar = frappe.new_doc("Auto Repeat")
+		ar.update(
+			{
+				"reference_doctype": "Journal Entry",
+				"reference_document": "JE-DUMMY",
+				"repeat_type": "Reversal",
+				"reverse_on_next_month": 0,
+				"reverse_date": None,
+				"start_date": today(),
+				"frequency": "",
+			}
+		)
+		# validate_repeat_type runs before reference_document is dereferenced
+		with self.assertRaisesRegex(
+			frappe.ValidationError, "either 'Reverse on First Day of Next Month'"
+		):
+			ar.validate_repeat_type()
+
+	def test_skip_cancelled_source_no_amendment(self):
+		"""TC-001: Source cancelled, no amendment, skip_if_source_cancelled=1 → AR disabled."""
+		create_submittable_doctype("AR Cancel Source Test")
+		src = frappe.get_doc({"doctype": "AR Cancel Source Test", "test": "x"}).insert()
+		src.submit()
+		ar = make_auto_repeat(reference_doctype="AR Cancel Source Test", reference_document=src.name)
+		ar.skip_if_source_cancelled = 1
+		ar.follow_amendment_chain = 0
+		ar.save()
+		# Cancel the source
+		src.cancel()
+		ar.reload()
+		# Trigger run
+		ar.create_documents()
+		ar.reload()
+		self.assertEqual(ar.disabled, 1)
+		self.assertEqual(ar.status, "Disabled")
+
+	def test_follow_amendment_chain_to_latest_version(self):
+		"""TC-002: Source cancelled but amended; AR resolves to the latest non-cancelled amendment."""
+		create_submittable_doctype("AR Amend Source Test")
+		src = frappe.get_doc({"doctype": "AR Amend Source Test", "test": "v1"}).insert()
+		src.submit()
+		ar = make_auto_repeat(reference_doctype="AR Amend Source Test", reference_document=src.name)
+		ar.follow_amendment_chain = 1
+		ar.save()
+
+		# Amend: cancel + insert successor with amended_from
+		src.cancel()
+		amended = frappe.copy_doc(src)
+		amended.amended_from = src.name
+		amended.test = "v2"
+		amended.insert()
+		amended.submit()
+
+		ar.reload()
+		resolved = ar.get_authoritative_source()
+		self.assertIsNotNone(resolved)
+		self.assertEqual(resolved.name, amended.name)
+		ar.reload()
+		self.assertEqual(ar.current_source_document, amended.name)
+
+	def test_amendment_chain_walks_multiple_steps(self):
+		"""TC-002b: Multi-hop amendment chain resolves to the latest non-cancelled successor."""
+		create_submittable_doctype("AR Multi Amend Test")
+		v1 = frappe.get_doc({"doctype": "AR Multi Amend Test", "test": "v1"}).insert()
+		v1.submit()
+		ar = make_auto_repeat(reference_doctype="AR Multi Amend Test", reference_document=v1.name)
+		ar.follow_amendment_chain = 1
+		ar.save()
+
+		# v1 → v2 → v3 — only v3 should remain non-cancelled
+		v1.cancel()
+		v2 = frappe.copy_doc(v1)
+		v2.amended_from = v1.name
+		v2.test = "v2"
+		v2.insert()
+		v2.submit()
+		v2.cancel()
+		v3 = frappe.copy_doc(v2)
+		v3.amended_from = v2.name
+		v3.test = "v3"
+		v3.insert()
+		v3.submit()
+
+		ar.reload()
+		resolved = ar.get_authoritative_source()
+		self.assertEqual(resolved.name, v3.name)
+
+	def test_skip_cancelled_source_returns_none_when_no_amendment(self):
+		"""TC-001b: get_authoritative_source returns None when source cancelled and no amendment."""
+		create_submittable_doctype("AR No Amend Test")
+		src = frappe.get_doc({"doctype": "AR No Amend Test", "test": "x"}).insert()
+		src.submit()
+		ar = make_auto_repeat(reference_doctype="AR No Amend Test", reference_document=src.name)
+		ar.follow_amendment_chain = 1
+		ar.save()
+		src.cancel()
+		ar.reload()
+		self.assertIsNone(ar.get_authoritative_source())
+
+	def test_set_dates_reversal_first_of_next_month(self):
+		"""TC-005a: Reversal mode with reverse_on_next_month sets next_schedule_date to first of next month."""
+		if not frappe.db.exists("DocType", "Journal Entry"):
+			self.skipTest("Journal Entry doctype not available — Frappe-only site")
+		ar = frappe.new_doc("Auto Repeat")
+		ar.update(
+			{
+				"reference_doctype": "Journal Entry",
+				"reference_document": "JE-DUMMY",
+				"repeat_type": "Reversal",
+				"reverse_on_next_month": 1,
+				"start_date": today(),
+				"frequency": "",
+			}
+		)
+		ar.set_dates()
+		from frappe.utils import get_first_day
+
+		expected = get_first_day(add_months(getdate(), 1))
+		self.assertEqual(getdate(ar.next_schedule_date), getdate(expected))
+
+	def test_set_dates_reversal_specific_date(self):
+		"""TC-005b: Reversal mode with reverse_date overrides reverse_on_next_month."""
+		if not frappe.db.exists("DocType", "Journal Entry"):
+			self.skipTest("Journal Entry doctype not available — Frappe-only site")
+		target = add_days(today(), 14)
+		ar = frappe.new_doc("Auto Repeat")
+		ar.update(
+			{
+				"reference_doctype": "Journal Entry",
+				"reference_document": "JE-DUMMY",
+				"repeat_type": "Reversal",
+				"reverse_on_next_month": 0,
+				"reverse_date": target,
+				"start_date": today(),
+				"frequency": "",
+			}
+		)
+		ar.set_dates()
+		self.assertEqual(getdate(ar.next_schedule_date), getdate(target))
+
+	def test_copy_mode_unchanged_when_refresh_switches_off(self):
+		"""Regression: with all refresh switches off, Copy mode behaves identically to today."""
+		todo = frappe.get_doc(
+			doctype="ToDo", description="copy-mode regression test", assigned_by="Administrator"
+		).insert()
+		doc = make_auto_repeat(reference_document=todo.name)
+		# All new switches default off; refresh_mode default "Copy Original"
+		self.assertEqual(doc.repeat_type, "Copy")
+		self.assertEqual(doc.refresh_mode, "Copy Original")
+		self.assertEqual(doc.refresh_prices, 0)
+		self.assertEqual(doc.refresh_exchange_rate, 0)
+		self.assertEqual(doc.recalculate_taxes, 0)
+		# Should run as before
+		data = get_auto_repeat_entries(getdate(today()))
+		create_repeated_entries(data)
+		frappe.db.commit()
+		new_todo = frappe.db.get_value(
+			"ToDo", {"auto_repeat": doc.name, "name": ("!=", todo.name)}, "name"
+		)
+		self.assertIsNotNone(new_todo)
+
 	def test_auto_repeat_assignee_with_separate_documents(self):
 		todo = frappe.get_doc(
 			doctype="ToDo",
