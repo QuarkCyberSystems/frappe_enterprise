@@ -347,6 +347,7 @@ class TestAutoRepeat(IntegrationTestCase):
 		ar.follow_amendment_chain = 0
 		ar.save()
 		# Cancel the source
+		src.reload()
 		src.cancel()
 		ar.reload()
 		# Trigger run
@@ -365,8 +366,10 @@ class TestAutoRepeat(IntegrationTestCase):
 		ar.save()
 
 		# Amend: cancel + insert successor with amended_from
+		src.reload()
 		src.cancel()
 		amended = frappe.copy_doc(src)
+		amended.docstatus = 0  # copy_doc preserves docstatus from cancelled source
 		amended.amended_from = src.name
 		amended.test = "v2"
 		amended.insert()
@@ -389,14 +392,18 @@ class TestAutoRepeat(IntegrationTestCase):
 		ar.save()
 
 		# v1 → v2 → v3 — only v3 should remain non-cancelled
+		v1.reload()
 		v1.cancel()
 		v2 = frappe.copy_doc(v1)
+		v2.docstatus = 0
 		v2.amended_from = v1.name
 		v2.test = "v2"
 		v2.insert()
 		v2.submit()
+		v2.reload()
 		v2.cancel()
 		v3 = frappe.copy_doc(v2)
+		v3.docstatus = 0
 		v3.amended_from = v2.name
 		v3.test = "v3"
 		v3.insert()
@@ -414,6 +421,7 @@ class TestAutoRepeat(IntegrationTestCase):
 		ar = make_auto_repeat(reference_doctype="AR No Amend Test", reference_document=src.name)
 		ar.follow_amendment_chain = 1
 		ar.save()
+		src.reload()
 		src.cancel()
 		ar.reload()
 		self.assertIsNone(ar.get_authoritative_source())
