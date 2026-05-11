@@ -688,19 +688,26 @@ class AutoRepeat(Document):
 		return reference_doc
 
 	def find_latest_amendment(self, cancelled_doc):
-		"""Walk the amended_from chain and return the latest non-cancelled successor."""
+		"""Walk the amended_from chain forward and return the latest non-cancelled successor.
+
+		Multi-hop: if cancelled_doc was amended into a successor that is ALSO cancelled,
+		recurse on that successor to find the next-generation amendment. Returns None
+		only when the chain ends at a cancelled doc with no further amendments.
+		"""
 		amended = frappe.db.get_value(
 			self.reference_doctype,
-			{"amended_from": cancelled_doc.name, "docstatus": ["!=", 2]},
-			["name"],
+			{"amended_from": cancelled_doc.name},
+			["name", "docstatus"],
 			as_dict=True,
 		)
 		if not amended:
 			return None
-		doc = frappe.get_doc(self.reference_doctype, amended.name)
-		if doc.docstatus == 2:
-			return self.find_latest_amendment(doc)
-		return doc
+		if amended.docstatus == 2:
+			# Successor is also cancelled — walk further forward.
+			return self.find_latest_amendment(
+				frappe.get_doc(self.reference_doctype, amended.name)
+			)
+		return frappe.get_doc(self.reference_doctype, amended.name)
 
 	def handle_no_valid_source(self):
 		"""Source is cancelled with no valid amendment — skip-and-disable, or throw."""
