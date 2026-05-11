@@ -17,6 +17,16 @@
 import "./commands";
 import "@cypress/code-coverage/support";
 
+// ERPNext-side custom commands (Badia WP test helpers). Auto-loaded so any
+// `**/ui_test_*.js` spec under ERPNext has the helpers available without
+// importing per-spec. Falls back silently if ERPNext isn't installed.
+try {
+	// eslint-disable-next-line @typescript-eslint/no-require-imports
+	require("../../../erpnext/erpnext/public/js/cypress_commands.js");
+} catch (e) {
+	// ERPNext not present — Frappe-only Cypress runs proceed unchanged.
+}
+
 Cypress.on("uncaught:exception", (err, runnable) => {
 	return false;
 });
