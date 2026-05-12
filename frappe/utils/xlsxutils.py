@@ -22,6 +22,31 @@ ILLEGAL_CHARACTERS_RE = re.compile(
 )
 
 
+# Forward-compat shims for ERPNext fork integration. The upstream PR that
+# introduces XLSXMetadata + XLSXStyleBuilder (#36323 / commit ed875d5c9a) is
+# not yet merged into this frappe branch, but erpnext.financial_report_engine
+# (and modules that transitively import it) reference these classes at module
+# load time. Stubs let imports resolve so test discovery + non-xlsx code paths
+# work. Any real xlsx-style export will hit a clean AttributeError on use, not
+# a hidden import-time crash.
+class XLSXMetadata:
+	"""Stub. Replace with upstream implementation when PR #36323 lands."""
+
+	def __init__(self, *args, **kwargs):
+		raise NotImplementedError(
+			"XLSXMetadata is a forward-compat stub. Backport frappe PR #36323 to enable."
+		)
+
+
+class XLSXStyleBuilder:
+	"""Stub. Replace with upstream implementation when PR #36323 lands."""
+
+	def __init__(self, *args, **kwargs):
+		raise NotImplementedError(
+			"XLSXStyleBuilder is a forward-compat stub. Backport frappe PR #36323 to enable."
+		)
+
+
 def get_excel_date_format():
 	date_format = frappe.get_system_settings("date_format")
 	time_format = frappe.get_system_settings("time_format")
