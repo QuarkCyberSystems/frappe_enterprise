@@ -344,9 +344,42 @@ class AutoRepeat(Document):
 		if reference_doc is None:
 			return self.handle_no_valid_source()
 
+		# Hook-based dispatch: apps can register doctype-specific handlers via
+		# `auto_repeat_handlers` in their hooks.py. Structure:
+		#     auto_repeat_handlers = {
+		#         "<Reference Doctype>": {
+		#             "<repeat_type value>": "myapp.module.handler_function",
+		#         }
+		#     }
+		# Handler signature: handler(auto_repeat, reference_doc, assignee=None) -> Document
+		# When no handler is registered, fall through to the built-in dispatch
+		# below, so this is additive and existing installations are unaffected.
+		handler_path = self._resolve_repeat_handler()
+		if handler_path:
+			handler = frappe.get_attr(handler_path)
+			return handler(auto_repeat=self, reference_doc=reference_doc, assignee=assignee)
+
 		if self.repeat_type == "Reversal":
 			return self.make_reversal_document(reference_doc)
 		return self.make_copy_document(reference_doc, assignee)
+
+	def _resolve_repeat_handler(self):
+		"""Return the dotted-path of a registered handler for
+		(reference_doctype, repeat_type), or None if none registered."""
+		hooks = frappe.get_hooks("auto_repeat_handlers") or {}
+		# get_hooks returns dict-of-dict or dict-of-list-of-dict depending on
+		# how the host app declared the value; normalise both.
+		by_doctype = hooks.get(self.reference_doctype)
+		if isinstance(by_doctype, list):
+			# multiple apps may extend the same doctype; last-write-wins
+			merged = {}
+			for entry in by_doctype:
+				if isinstance(entry, dict):
+					merged.update(entry)
+			by_doctype = merged
+		if not isinstance(by_doctype, dict):
+			return None
+		return by_doctype.get(self.repeat_type)
 
 	def make_copy_document(self, reference_doc, assignee=None):
 		new_doc = frappe.copy_doc(reference_doc, ignore_no_copy=False)
