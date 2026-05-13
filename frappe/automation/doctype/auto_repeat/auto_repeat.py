@@ -159,7 +159,7 @@ class AutoRepeat(Document):
 		validate_template(self.message or "")
 
 	def before_save(self):
-		self.warn_on_non_true_reversal()
+		pass
 
 	def before_insert(self):
 		if not frappe.in_test:
@@ -180,12 +180,12 @@ class AutoRepeat(Document):
 			return
 
 		if self.repeat_type == "Reversal":
-			# Reversal mode is single-execution; next_schedule_date is the configured reversal date
-			# so the existing scheduler dispatch path picks it up on the right day.
-			if self.reverse_on_next_month:
-				self.next_schedule_date = get_first_day(add_months(getdate(), 1))
-			elif self.reverse_date:
-				self.next_schedule_date = getdate(self.reverse_date)
+			# Reversal mode is single-execution; the consuming app sets
+			# start_date to the desired schedule date when creating the AR.
+			# Doctype-specific schedule semantics (e.g. JE's "First Day of
+			# Next Month" vs Specific Date) live in the registered handler,
+			# not here.
+			self.next_schedule_date = getdate(self.start_date)
 			return
 
 		self.next_schedule_date = self.get_next_schedule_date(schedule_date=self.start_date)
@@ -344,9 +344,47 @@ class AutoRepeat(Document):
 		if reference_doc is None:
 			return self.handle_no_valid_source()
 
+		# Hook-based dispatch: apps can register doctype-specific handlers via
+		# `auto_repeat_handlers` in their hooks.py. Structure:
+		#     auto_repeat_handlers = {
+		#         "<Reference Doctype>": {
+		#             "<repeat_type value>": "myapp.module.handler_function",
+		#         }
+		#     }
+		# Handler signature: handler(auto_repeat, reference_doc, assignee=None) -> Document
+		# When no handler is registered, fall through to the built-in dispatch
+		# below, so this is additive and existing installations are unaffected.
+		handler_path = self._resolve_repeat_handler()
+		if handler_path:
+			handler = frappe.get_attr(handler_path)
+			return handler(auto_repeat=self, reference_doc=reference_doc, assignee=assignee)
+
 		if self.repeat_type == "Reversal":
-			return self.make_reversal_document(reference_doc)
+			# Doctype-specific reversal logic must be supplied by the consuming
+			# app via the `auto_repeat_handlers` hook in its hooks.py.
+			frappe.throw(_(
+				"No Auto Repeat reversal handler registered for {0}. "
+				"Add an entry to `auto_repeat_handlers` in your app's hooks.py."
+			).format(self.reference_doctype))
 		return self.make_copy_document(reference_doc, assignee)
+
+	def _resolve_repeat_handler(self):
+		"""Return the dotted-path of a registered handler for
+		(reference_doctype, repeat_type), or None if none registered."""
+		hooks = frappe.get_hooks("auto_repeat_handlers") or {}
+		# get_hooks returns dict-of-dict or dict-of-list-of-dict depending on
+		# how the host app declared the value; normalise both.
+		by_doctype = hooks.get(self.reference_doctype)
+		if isinstance(by_doctype, list):
+			# multiple apps may extend the same doctype; last-write-wins
+			merged = {}
+			for entry in by_doctype:
+				if isinstance(entry, dict):
+					merged.update(entry)
+			by_doctype = merged
+		if not isinstance(by_doctype, dict):
+			return None
+		return by_doctype.get(self.repeat_type)
 
 	def make_copy_document(self, reference_doc, assignee=None):
 		new_doc = frappe.copy_doc(reference_doc, ignore_no_copy=False)
@@ -612,61 +650,22 @@ class AutoRepeat(Document):
 	# ──────────────────────────────────────────────────────────────────────
 
 	def validate_repeat_type(self):
-		if self.repeat_type != "Reversal":
-			return
+		"""Validate generic preconditions for `repeat_type`.
 
-		if self.reference_doctype != "Journal Entry":
-			frappe.throw(_("Reversal mode is only supported for Journal Entry"))
-
-		if not frappe.db.exists("DocType", "Journal Entry"):
-			# Frappe-only site without ERPNext — Reversal cannot work
-			frappe.throw(_("Reversal mode requires the ERPNext app (Journal Entry doctype not found)"))
-
-		if not (self.reverse_on_next_month or self.reverse_date):
-			frappe.throw(
-				_(
-					"Reversal mode requires either 'Reverse on First Day of Next Month' "
-					"or a specific 'Reversal Date'"
-				)
-			)
-
-	def warn_on_non_true_reversal(self):
-		"""Surface a warning when Reversal-mode settings break true-reversal semantics.
-
-		These choices are legitimate for adjustment scenarios (revaluation, restatement),
-		but break the perfect-offset property required for immutable-ledger compliance.
-		Warn — do not throw.
+		Doctype-specific validation (e.g. JE requiring a configured reversal
+		schedule) lives in the consuming app's auto_repeat_handlers entry —
+		that handler can raise before frappe schedules anything. Here we only
+		check that a handler is in fact registered for any non-Copy mode.
 		"""
-		if self.repeat_type != "Reversal":
+		if self.repeat_type in (None, "", "Copy"):
 			return
-		warnings = []
-		if self.reversal_exchange_rate_type == "Current Rate":
-			warnings.append(
-				_(
-					"Using 'Current Rate' for the reversal will create an FX gain/loss "
-					"instead of a perfect offset of the original entry."
-				)
-			)
-		if self.reversal_tax_mode == "Recalculate for Posting Date":
-			warnings.append(
-				_(
-					"Recalculating taxes on the reversal posting date breaks immutable-ledger "
-					"compliance for true reversals — only enable for adjustment scenarios."
-				)
-			)
-		if self.reversal_cost_center_mode == "Apply Current Allocation":
-			warnings.append(
-				_(
-					"Applying current Cost Center Allocation rules to the reversal breaks "
-					"immutable-ledger compliance for true reversals."
-				)
-			)
-		if warnings:
-			frappe.msgprint(
-				"<br>".join(warnings),
-				title=_("Reversal Configuration Warning"),
-				indicator="orange",
-			)
+
+		handler_path = self._resolve_repeat_handler()
+		if not handler_path:
+			frappe.throw(_(
+				"No Auto Repeat handler registered for repeat_type={0} on doctype {1}. "
+				"Add an entry to `auto_repeat_handlers` in your app's hooks.py."
+			).format(self.repeat_type, self.reference_doctype))
 
 	def get_authoritative_source(self):
 		"""Resolve the source document, following the amendment chain when configured.
@@ -997,201 +996,6 @@ class AutoRepeat(Document):
 						f"valid for {posting_date}. GL distribution will apply at posting time."
 					),
 				)
-
-	# ── Reversal-mode helpers ─────────────────────────────────────────────
-
-	def make_reversal_document(self, reference_doc):
-		"""Create a reversal Journal Entry from the source via ERPNext's existing helper.
-
-		Single-execution: the Auto Repeat is disabled after one successful insert,
-		regardless of whether auto_submit_reversal succeeded.
-		"""
-		try:
-			from erpnext.accounts.doctype.journal_entry.journal_entry import (
-				make_reverse_journal_entry,
-			)
-		except ImportError:
-			frappe.throw(_("Reversal mode requires the ERPNext app to be installed"))
-
-		# GA-0001-01 already exposes is_reversed on the source; if the source has been
-		# reversed by hand (or by a previous AR run), we never recurse — log + disable.
-		if getattr(reference_doc, "is_reversed", 0):
-			frappe.log_error(
-				title="Auto Repeat Skipped",
-				message=f"Auto Repeat {self.name}: source {reference_doc.name} already reversed.",
-			)
-			self.db_set("disabled", 1)
-			self.db_set("status", "Completed")
-			if reference_doc.doctype == "Journal Entry" and reference_doc.meta.has_field(
-				"auto_reversal_status"
-			):
-				frappe.db.set_value(
-					"Journal Entry", reference_doc.name, "auto_reversal_status", "Cancelled"
-				)
-			return None
-
-		reversal = make_reverse_journal_entry(reference_doc.name)
-
-		# Schedule
-		if self.reverse_on_next_month:
-			reversal.posting_date = get_first_day(add_months(getdate(), 1))
-		elif self.reverse_date:
-			reversal.posting_date = getdate(self.reverse_date)
-
-		# WP GAP-013/014 — make_reverse_journal_entry does not copy cost_center / party / project.
-		self.enhance_reversal_mapping(reversal, reference_doc)
-
-		# WP GAP-021 / Phase 5.1 — FX handling
-		if self.reversal_exchange_rate_type == "Current Rate":
-			self.refresh_reversal_exchange_rate(reversal, reference_doc)
-
-		# WP GAP-022 — cost-center allocation audit
-		if self.reversal_cost_center_mode == "Apply Current Allocation":
-			self.apply_reversal_cost_center_allocation(reversal)
-
-		# WP GAP-021 — tax recalculation (audit-only — see imp plan §6 sign-off #4)
-		if self.reversal_tax_mode == "Recalculate for Posting Date":
-			self.recalculate_reversal_taxes(reversal)
-
-		reversal.user_remark = (reversal.user_remark or "") + (
-			f"\nAuto-created by Auto Repeat {self.name}".strip()
-		)
-		reversal.flags.ignore_permissions = True
-		reversal.flags.updater_reference = {
-			"doctype": self.doctype,
-			"docname": self.name,
-			"label": _("via Auto Repeat (Reversal)"),
-		}
-		reversal.insert()
-
-		# Wire the JE-side status fields if ERPNext has them (added by GA-0001-05+06 ERPNext PR)
-		je_meta = frappe.get_meta("Journal Entry")
-		updates = {}
-		if je_meta.has_field("linked_auto_repeat"):
-			updates["linked_auto_repeat"] = self.name
-		if je_meta.has_field("auto_reversal_status"):
-			updates["auto_reversal_status"] = "Scheduled"
-		if updates:
-			frappe.db.set_value("Journal Entry", reference_doc.name, updates)
-
-		if self.auto_submit_reversal:
-			try:
-				reversal.submit()
-				if je_meta.has_field("auto_reversal_status"):
-					frappe.db.set_value(
-						"Journal Entry", reference_doc.name, "auto_reversal_status", "Completed"
-					)
-			except Exception:
-				if je_meta.has_field("auto_reversal_status"):
-					frappe.db.set_value(
-						"Journal Entry", reference_doc.name, "auto_reversal_status", "Failed"
-					)
-				raise
-
-		# Single-execution semantics — disable after first successful insert
-		self.db_set("disabled", 1)
-		self.db_set("status", "Completed")
-		return reversal
-
-	def enhance_reversal_mapping(self, reversal, original):
-		"""Copy cost_center / party / project / user_remark per-row.
-
-		make_reverse_journal_entry's field_map only swaps debit ↔ credit; everything
-		else needs explicit copying. We pair rows positionally because the field_map
-		preserves row order.
-		"""
-		for i, row in enumerate(reversal.accounts):
-			if i >= len(original.accounts):
-				break
-			orig = original.accounts[i]
-			row.cost_center = orig.get("cost_center")
-			row.project = orig.get("project")
-			row.party_type = orig.get("party_type")
-			row.party = orig.get("party")
-			if not row.user_remark and orig.get("user_remark"):
-				row.user_remark = orig.user_remark
-
-	def refresh_reversal_exchange_rate(self, reversal, original):
-		"""Revalue the reversal at the FX rate of the reversal posting date.
-
-		Breaks immutable-ledger compliance — the operator was warned at save time.
-		"""
-		try:
-			from erpnext.setup.utils import get_exchange_rate
-		except ImportError:
-			return
-		if not getattr(reversal, "multi_currency", 0):
-			return
-		posting_date = reversal.posting_date or getdate()
-		company_currency = frappe.get_cached_value(
-			"Company", reversal.company, "default_currency"
-		)
-		for row in reversal.accounts:
-			if row.account_currency and row.account_currency != company_currency:
-				try:
-					new_rate = get_exchange_rate(
-						row.account_currency, company_currency, posting_date
-					)
-				except Exception:
-					continue
-				if new_rate:
-					row.exchange_rate = flt(new_rate)
-					row.debit = flt(row.debit_in_account_currency) * flt(new_rate)
-					row.credit = flt(row.credit_in_account_currency) * flt(new_rate)
-		if hasattr(reversal, "set_total_debit_credit"):
-			reversal.set_total_debit_credit()
-
-	def apply_reversal_cost_center_allocation(self, reversal):
-		"""Audit Cost Center Allocation rules for the reversal posting date."""
-		try:
-			from erpnext.accounts.general_ledger import get_cost_center_allocation_data
-		except ImportError:
-			return
-		posting_date = reversal.posting_date or getdate()
-		company = reversal.company
-		seen = set()
-		for row in reversal.accounts:
-			if not row.cost_center or row.cost_center in seen:
-				continue
-			seen.add(row.cost_center)
-			try:
-				allocation = get_cost_center_allocation_data(
-					company, posting_date, row.cost_center
-				)
-			except Exception:
-				continue
-			if allocation:
-				frappe.log_error(
-					title="Auto Repeat Reversal Cost Center Allocation",
-					message=(
-						f"Auto Repeat {self.name}: reversal cost center {row.cost_center} "
-						f"has allocation rules for {posting_date}. "
-						f"GL distribution will apply at posting time: {allocation}"
-					),
-				)
-
-	def recalculate_reversal_taxes(self, reversal):
-		"""Audit-log per-tax-account when 'Recalculate for Posting Date' is selected.
-
-		Per WP §4.2 GAP-021 (status CLOSED) and imp-plan sign-off #4: actual amount
-		recomputation on a JE reversal is genuinely complex and is deferred. The
-		setting exists for the audit trail; we record a log row per tax account so
-		Finance can review whether manual adjustment is needed.
-		"""
-		for row in reversal.accounts:
-			if not row.account:
-				continue
-			account_type = frappe.get_cached_value("Account", row.account, "account_type")
-			if account_type == "Tax":
-				frappe.log_error(
-					title="Auto Repeat Reversal Tax Note",
-					message=(
-						f"Auto Repeat {self.name}: tax account {row.account} on the reversal "
-						f"keeps the original amount. If tax rates changed between the original "
-						f"and reversal posting dates, manual adjustment may be required."
-					),
-				)
-
 
 def get_next_date(dt, mcount, day=None):
 	dt = getdate(dt)
