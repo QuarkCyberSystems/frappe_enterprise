@@ -1,49 +1,5 @@
 # Copyright (c) 2018, Frappe Technologies Pvt. Ltd. and contributors
 # License: MIT. See LICENSE
-"""Auto Repeat — recurring document creation, with two modes.
-
-Originally (pre-WP GA-0001-05+06): Auto Repeat had a single behaviour — on every
-schedule tick it deep-copied the source document via `frappe.copy_doc` and
-inserted the copy. The copy carried whatever was on the source verbatim.
-
-That behaviour is preserved as **Copy mode** (the default; existing Auto Repeats
-keep behaving byte-identically when all refresh switches are off). The WP added:
-
-1. **Source-validation handling** (GAP-001, GAP-009)
-   `skip_if_source_cancelled` + `follow_amendment_chain` resolve the source to
-   the latest non-cancelled version — see `get_authoritative_source` /
-   `find_latest_amendment`. When the source is cancelled with no valid amendment,
-   the AR self-disables, logs, and (optionally) emails recipients.
-
-2. **Copy-mode dynamic refresh** (GAP-002..008, GAP-019..020, GAP-024..027)
-   `refresh_mode` + per-field switches re-derive prices, FX rate, taxes, payment
-   schedule, sales/purchase/item tax templates, shipping rule, and cost-center
-   allocation for the new posting date. Each helper is bounded, idempotent, and
-   silently no-ops when the optional ERPNext dependency is missing.
-
-3. **Reversal mode** (GAP-012..015, GAP-021..023)
-   `repeat_type = "Reversal"` (Journal Entry only) hands off to ERPNext's
-   `make_reverse_journal_entry`, schedules for "first of next month" or a
-   specific date via the existing scheduler dispatch path, and disables itself
-   after a single execution. `reversal_exchange_rate_type`,
-   `reversal_tax_mode`, and `reversal_cost_center_mode` toggle Original-Rate
-   (true reversal, perfect offset) vs Current-Rate / Recalculate / Apply-Current
-   semantics for adjustment scenarios. Non-true-reversal choices are warned at
-   save time but never blocked.
-
-GAP-010 (`amended_from` cleared by `copy_doc`) is architecturally resolved:
-`get_authoritative_source` walks the amendment chain to the latest version
-*before* `copy_doc` runs, so the cleared `amended_from` on the new doc is the
-correct outcome — a recurring copy is not an amendment of the source.
-
-GAP-011 (immutable-ledger awareness) is surfaced as warnings on Reversal
-configurations that break true-reversal semantics (Current Rate, Recalculate
-Tax, Apply Current Allocation). The warnings are non-blocking — those choices
-are legitimate for adjustment / restatement scenarios.
-
-Full per-gap rationale: see `badia_docs/signed_off_wp/imp_ga-0001-05+06.md` in
-the originating implementation tree, or the upstream PR description.
-"""
 
 from datetime import timedelta
 
@@ -61,9 +17,7 @@ from frappe.desk.form.assign_to import add as assign_to
 from frappe.model.document import Document
 from frappe.utils import (
 	add_days,
-	add_months,
 	cstr,
-	flt,
 	get_first_day,
 	get_last_day,
 	getdate,
@@ -98,13 +52,9 @@ class AutoRepeat(Document):
 		from frappe.automation.doctype.auto_repeat_user.auto_repeat_user import AutoRepeatUser
 		from frappe.types import DF
 
-		apply_pricing_rules: DF.Check
 		assignee: DF.TableMultiSelect[AutoRepeatUser]
-		auto_submit_reversal: DF.Check
-		current_source_document: DF.DynamicLink | None
 		disabled: DF.Check
 		end_date: DF.Date | None
-		follow_amendment_chain: DF.Check
 		frequency: DF.Literal[
 			"", "Daily", "Weekly", "Fortnightly", "Monthly", "Quarterly", "Half-yearly", "Yearly"
 		]
@@ -113,29 +63,12 @@ class AutoRepeat(Document):
 		next_schedule_date: DF.Date | None
 		notify_by_email: DF.Check
 		print_format: DF.Link | None
-		recalculate_payment_terms: DF.Check
-		recalculate_taxes: DF.Check
 		recipients: DF.SmallText | None
 		reference_doctype: DF.Link
 		reference_document: DF.DynamicLink
-		refresh_exchange_rate: DF.Check
-		refresh_item_tax_template: DF.Check
-		refresh_mode: DF.Literal["Copy Original", "Recalculate"]
-		refresh_prices: DF.Check
-		refresh_purchase_tax_template: DF.Check
-		refresh_sales_tax_template: DF.Check
-		refresh_shipping_rule: DF.Check
 		repeat_on_day: DF.Int
 		repeat_on_days: DF.Table[AutoRepeatDay]
 		repeat_on_last_day: DF.Check
-		repeat_type: DF.Literal["Copy", "Reversal"]
-		respect_cost_center_allocation: DF.Check
-		reversal_cost_center_mode: DF.Literal["Use Original", "Apply Current Allocation"]
-		reversal_exchange_rate_type: DF.Literal["Original Rate", "Current Rate"]
-		reversal_tax_mode: DF.Literal["Use Original", "Recalculate for Posting Date"]
-		reverse_date: DF.Date | None
-		reverse_on_next_month: DF.Check
-		skip_if_source_cancelled: DF.Check
 		start_date: DF.Date
 		status: DF.Literal["", "Active", "Disabled", "Completed"]
 		subject: DF.Data | None
@@ -145,7 +78,6 @@ class AutoRepeat(Document):
 
 	def validate(self):
 		self.update_status()
-		self.validate_repeat_type()
 		self.validate_reference_doctype()
 		self.validate_submit_on_creation()
 		self.validate_dates()
@@ -157,9 +89,6 @@ class AutoRepeat(Document):
 
 		validate_template(self.subject or "")
 		validate_template(self.message or "")
-
-	def before_save(self):
-		pass
 
 	def before_insert(self):
 		if not frappe.in_test:
@@ -177,20 +106,10 @@ class AutoRepeat(Document):
 	def set_dates(self):
 		if self.disabled:
 			self.next_schedule_date = None
-			return
-
-		if self.repeat_type == "Reversal":
-			# Reversal mode is single-execution; the consuming app sets
-			# start_date to the desired schedule date when creating the AR.
-			# Doctype-specific schedule semantics (e.g. JE's "First Day of
-			# Next Month" vs Specific Date) live in the registered handler,
-			# not here.
-			self.next_schedule_date = getdate(self.start_date)
-			return
-
-		self.next_schedule_date = self.get_next_schedule_date(schedule_date=self.start_date)
-		if self.end_date and getdate(self.end_date) < getdate(self.next_schedule_date):
-			frappe.throw(_("The Next Scheduled Date cannot be later than the End Date."))
+		else:
+			self.next_schedule_date = self.get_next_schedule_date(schedule_date=self.start_date)
+			if self.end_date and getdate(self.end_date) < getdate(self.next_schedule_date):
+				frappe.throw(_("The Next Scheduled Date cannot be later than the End Date."))
 
 	def unlink_if_applicable(self):
 		if self.status == "Completed" or self.disabled:
@@ -267,10 +186,6 @@ class AutoRepeat(Document):
 			frappe.db.set_value(self.reference_doctype, self.reference_document, "auto_repeat", self.name)
 
 	def update_status(self):
-		# A Reversal-mode AR that has finished its single execution sets disabled=1
-		# and status="Completed" directly via db_set; preserve that on the next save.
-		if self.repeat_type == "Reversal" and self.disabled and self.status == "Completed":
-			return
 		if self.disabled:
 			self.status = "Disabled"
 		elif self.is_completed():
@@ -340,73 +255,7 @@ class AutoRepeat(Document):
 		return docs
 
 	def make_new_document(self, assignee=None):
-		reference_doc = self.get_authoritative_source()
-		if reference_doc is None:
-			return self.handle_no_valid_source()
-
-		# Hook-based dispatch: apps can register doctype-specific handlers via
-		# `auto_repeat_handlers` in their hooks.py. Structure:
-		#     auto_repeat_handlers = {
-		#         "<Reference Doctype>": {
-		#             "<repeat_type value>": "myapp.module.handler_function",
-		#         }
-		#     }
-		# Handler signature: handler(auto_repeat, reference_doc, assignee=None) -> Document
-		# When no handler is registered, fall through to the built-in dispatch
-		# below, so this is additive and existing installations are unaffected.
-		handler_path = self._resolve_repeat_handler()
-		if handler_path:
-			handler = frappe.get_attr(handler_path)
-			return handler(auto_repeat=self, reference_doc=reference_doc, assignee=assignee)
-
-		if self.repeat_type == "Reversal":
-			# Doctype-specific reversal logic must be supplied by the consuming
-			# app via the `auto_repeat_handlers` hook in its hooks.py.
-			frappe.throw(_(
-				"No Auto Repeat reversal handler registered for {0}. "
-				"Add an entry to `auto_repeat_handlers` in your app's hooks.py."
-			).format(self.reference_doctype))
-		return self.make_copy_document(reference_doc, assignee)
-
-	def _resolve_repeat_handler(self):
-		"""Return the dotted-path of a registered handler for
-		(reference_doctype, repeat_type), or None if none registered."""
-		hooks = frappe.get_hooks("auto_repeat_handlers") or {}
-		# get_hooks returns dict-of-dict or dict-of-list-of-dict depending on
-		# how the host app declared the value; normalise both.
-		by_doctype = hooks.get(self.reference_doctype)
-		if isinstance(by_doctype, list):
-			# multiple apps may extend the same doctype; last-write-wins
-			merged = {}
-			for entry in by_doctype:
-				if isinstance(entry, dict):
-					merged.update(entry)
-			by_doctype = merged
-		if not isinstance(by_doctype, dict):
-			return None
-		return by_doctype.get(self.repeat_type)
-
-	def _resolve_copy_refresh_handlers(self):
-		"""Return a list of dotted-paths for handlers that should run on the
-		new_doc after it's been deep-copied but before insert.
-
-		Apps register handlers under `auto_repeat_copy_refresh_handlers` keyed
-		by the reference doctype or "*" (apply to all). Multiple apps can
-		register; all matching handlers fire in declaration order.
-		"""
-		hooks = frappe.get_hooks("auto_repeat_copy_refresh_handlers") or {}
-		paths = []
-		for key in ("*", self.reference_doctype):
-			value = hooks.get(key)
-			if value is None:
-				continue
-			if isinstance(value, str):
-				paths.append(value)
-			elif isinstance(value, list):
-				paths.extend([v for v in value if isinstance(v, str)])
-		return paths
-
-	def make_copy_document(self, reference_doc, assignee=None):
+		reference_doc = frappe.get_doc(self.reference_doctype, self.reference_document)
 		new_doc = frappe.copy_doc(reference_doc, ignore_no_copy=False)
 		self.update_doc(new_doc, reference_doc)
 		new_doc.flags.updater_reference = {
@@ -414,15 +263,6 @@ class AutoRepeat(Document):
 			"docname": self.name,
 			"label": _("via Auto Repeat"),
 		}
-
-		# Hook: registered handlers (e.g. ERPNext-side) may mutate new_doc to
-		# refresh prices, taxes, FX, etc. The framework knows nothing about
-		# those concepts — that logic lives in the consuming app via
-		# `auto_repeat_copy_refresh_handlers` in hooks.py.
-		for handler_path in self._resolve_copy_refresh_handlers():
-			handler = frappe.get_attr(handler_path)
-			handler(auto_repeat=self, new_doc=new_doc, reference_doc=reference_doc)
-
 		new_doc.insert(ignore_permissions=True)
 		if assignee:
 			args = {
@@ -651,112 +491,6 @@ class AutoRepeat(Document):
 			args={"auto_repeat_failed_for": auto_repeat_failed_for, "error_log_message": error_log_message},
 			header=[subject, "red"],
 		)
-
-	# ──────────────────────────────────────────────────────────────────────
-	# WP GA-0001-05+06 — Repeat Type validation, source resolution, refresh,
-	# and reversal helpers.
-	# ──────────────────────────────────────────────────────────────────────
-
-	def validate_repeat_type(self):
-		"""Validate generic preconditions for `repeat_type`.
-
-		Doctype-specific validation (e.g. JE requiring a configured reversal
-		schedule) lives in the consuming app's auto_repeat_handlers entry —
-		that handler can raise before frappe schedules anything. Here we only
-		check that a handler is in fact registered for any non-Copy mode.
-		"""
-		if self.repeat_type in (None, "", "Copy"):
-			return
-
-		handler_path = self._resolve_repeat_handler()
-		if not handler_path:
-			frappe.throw(_(
-				"No Auto Repeat handler registered for repeat_type={0} on doctype {1}. "
-				"Add an entry to `auto_repeat_handlers` in your app's hooks.py."
-			).format(self.repeat_type, self.reference_doctype))
-
-	def get_authoritative_source(self):
-		"""Resolve the source document, following the amendment chain when configured.
-
-		Returns the live source doc, or None when the source is cancelled and either
-		(a) follow_amendment_chain=0, or (b) no non-cancelled amendment exists.
-		"""
-		reference_doc = frappe.get_doc(self.reference_doctype, self.reference_document)
-
-		if hasattr(reference_doc, "docstatus") and reference_doc.docstatus == 2:
-			if self.follow_amendment_chain:
-				latest = self.find_latest_amendment(reference_doc)
-				if latest:
-					self.db_set("current_source_document", latest.name)
-					return latest
-			return None
-
-		self.db_set("current_source_document", reference_doc.name)
-		return reference_doc
-
-	def find_latest_amendment(self, cancelled_doc):
-		"""Walk the amended_from chain forward and return the latest non-cancelled successor.
-
-		Multi-hop: if cancelled_doc was amended into a successor that is ALSO cancelled,
-		recurse on that successor to find the next-generation amendment. Returns None
-		only when the chain ends at a cancelled doc with no further amendments.
-		"""
-		amended = frappe.db.get_value(
-			self.reference_doctype,
-			{"amended_from": cancelled_doc.name},
-			["name", "docstatus"],
-			as_dict=True,
-		)
-		if not amended:
-			return None
-		if amended.docstatus == 2:
-			# Successor is also cancelled — walk further forward.
-			return self.find_latest_amendment(
-				frappe.get_doc(self.reference_doctype, amended.name)
-			)
-		return frappe.get_doc(self.reference_doctype, amended.name)
-
-	def handle_no_valid_source(self):
-		"""Source is cancelled with no valid amendment — skip-and-disable, or throw."""
-		msg = (
-			f"Auto Repeat {self.name}: source {self.reference_document} is cancelled "
-			f"and no valid amendment was found."
-		)
-		if self.skip_if_source_cancelled:
-			frappe.log_error(title="Auto Repeat Skipped", message=msg)
-			self.db_set("disabled", 1)
-			self.db_set("status", "Disabled")
-			if self.notify_by_email and self.recipients:
-				try:
-					self.send_skip_notification()
-				except Exception:
-					frappe.log_error(title="Auto Repeat Skip Notification Failed", message=msg)
-			return None
-		frappe.throw(
-			_("Cannot create document: source {0} is cancelled and no valid amendment found").format(
-				self.reference_document
-			)
-		)
-
-	def send_skip_notification(self):
-		"""Notify recipients that an Auto Repeat run was skipped due to a cancelled source."""
-		if not (self.notify_by_email and self.recipients):
-			return
-		subject = _("Auto Repeat Skipped: source cancelled — {0}").format(self.name)
-		message = _(
-			"Auto Repeat <b>{0}</b> was skipped because the source document <b>{1}</b> "
-			"is cancelled and no valid amendment was found. The Auto Repeat has been disabled."
-		).format(self.name, self.reference_document)
-		make(
-			doctype=self.doctype,
-			name=self.name,
-			recipients=self.recipients,
-			subject=subject,
-			content=message,
-			send_email=1,
-		)
-
-	# ── Copy-mode refresh helpers ─────────────────────────────────────────
 
 
 def get_next_date(dt, mcount, day=None):

@@ -10,17 +10,11 @@
  "field_order": [
   "reference_doctype",
   "reference_document",
-  "repeat_type",
   "submit_on_creation",
   "column_break_5",
   "start_date",
   "end_date",
   "disabled",
-  "source_validation_section",
-  "skip_if_source_cancelled",
-  "follow_amendment_chain",
-  "column_break_source",
-  "current_source_document",
   "section_break_10",
   "frequency",
   "repeat_on_day",
@@ -61,16 +55,6 @@
    "reqd": 1
   },
   {
-   "default": "Copy",
-   "description": "Copy: Creates duplicate documents on a recurring schedule. Reversal: Creates a single reversal entry on a scheduled date (Journal Entry only).",
-   "fieldname": "repeat_type",
-   "fieldtype": "Select",
-   "in_list_view": 1,
-   "label": "Repeat Type",
-   "options": "Copy\nReversal",
-   "reqd": 1
-  },
-  {
    "fieldname": "column_break_5",
    "fieldtype": "Column Break"
   },
@@ -96,39 +80,6 @@
    "no_copy": 1
   },
   {
-   "fieldname": "source_validation_section",
-   "fieldtype": "Section Break",
-   "label": "Source Validation"
-  },
-  {
-   "default": "1",
-   "description": "Skip and disable this Auto Repeat if the source document is cancelled and no valid amendment is found.",
-   "fieldname": "skip_if_source_cancelled",
-   "fieldtype": "Check",
-   "label": "Skip if Source Cancelled"
-  },
-  {
-   "default": "1",
-   "description": "If the source is cancelled, follow the amendment chain (amended_from) and use the latest non-cancelled version as the authoritative source.",
-   "fieldname": "follow_amendment_chain",
-   "fieldtype": "Check",
-   "label": "Follow Amendment Chain"
-  },
-  {
-   "fieldname": "column_break_source",
-   "fieldtype": "Column Break"
-  },
-  {
-   "description": "Latest authoritative source resolved on the last run. Updated automatically when the amendment chain is followed.",
-   "fieldname": "current_source_document",
-   "fieldtype": "Dynamic Link",
-   "label": "Current Source Document",
-   "no_copy": 1,
-   "options": "reference_doctype",
-   "read_only": 1
-  },
-  {
-   "depends_on": "eval:doc.repeat_type !== 'Reversal'",
    "fieldname": "section_break_10",
    "fieldtype": "Tab Break",
    "label": "Schedule"
@@ -138,8 +89,8 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Frequency",
-   "mandatory_depends_on": "eval:doc.repeat_type !== 'Reversal'",
-   "options": "\nDaily\nWeekly\nFortnightly\nMonthly\nQuarterly\nHalf-yearly\nYearly"
+   "options": "\nDaily\nWeekly\nFortnightly\nMonthly\nQuarterly\nHalf-yearly\nYearly",
+   "reqd": 1
   },
   {
    "fieldname": "column_break_12",
@@ -269,7 +220,7 @@
   }
  ],
  "links": [],
- "modified": "2026-05-05 13:30:00.000000",
+ "modified": "2025-06-09 18:20:23.775881",
  "modified_by": "Administrator",
  "module": "Automation",
  "name": "Auto Repeat",

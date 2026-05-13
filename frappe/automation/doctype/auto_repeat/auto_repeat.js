@@ -46,32 +46,14 @@ frappe.ui.form.on("Auto Repeat", {
 			);
 		}
 
-		// auto repeat schedule (Copy mode only — Reversal mode is single-execution)
-		if (frm.doc.repeat_type !== "Reversal") {
-			frappe.auto_repeat.render_schedule(frm);
-		} else {
-			frm.dashboard.hide();
-			frappe.auto_repeat.show_reversal_indicator(frm);
-		}
+		// auto repeat schedule
+		frappe.auto_repeat.render_schedule(frm);
 
 		frm.trigger("toggle_submit_on_creation");
 	},
 
 	reference_doctype: function (frm) {
 		frm.trigger("toggle_submit_on_creation");
-	},
-
-	repeat_type: function (frm) {
-		// Reversal-mode config (reverse_on_next_month / reverse_date /
-		// reversal_*) and Copy-mode refresh switches (refresh_prices /
-		// recalculate_taxes / refresh_*_template / etc.) all moved off the
-		// AR doctype in the upstream-shape refactor (Phases C + D,
-		// WP GA-0001-05+06). The consuming app owns both via registered
-		// handlers, so there's no AR-side state to clear when toggling.
-		if (frm.doc.repeat_type === "Reversal") {
-			// frequency is not required in Reversal mode — clear stale value
-			frm.set_value("frequency", "");
-		}
 	},
 
 	toggle_submit_on_creation: function (frm) {
@@ -126,25 +108,6 @@ frappe.ui.form.on("Auto Repeat", {
 		}
 	},
 });
-
-frappe.auto_repeat.show_reversal_indicator = function (frm) {
-	if (frm.is_new()) return;
-	let label, color;
-	if (frm.doc.status === "Completed") {
-		label = __("Reversal Completed");
-		color = "green";
-	} else if (frm.doc.disabled) {
-		label = __("Reversal Cancelled");
-		color = "grey";
-	} else if (frm.doc.next_schedule_date) {
-		label = __("Reversal Scheduled — {0}", [frappe.datetime.str_to_user(frm.doc.next_schedule_date)]);
-		color = "blue";
-	} else {
-		label = __("Reversal Mode");
-		color = "blue";
-	}
-	frm.dashboard.add_indicator(label, color);
-};
 
 frappe.auto_repeat.render_schedule = function (frm) {
 	if (!frm.is_dirty() && frm.doc.status !== "Disabled") {
