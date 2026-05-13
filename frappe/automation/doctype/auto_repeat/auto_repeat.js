@@ -62,57 +62,15 @@ frappe.ui.form.on("Auto Repeat", {
 	},
 
 	repeat_type: function (frm) {
-		// Reversal-mode config (reverse_on_next_month, reverse_date,
-		// reversal_*) moved off the AR onto the source doctype in the
-		// upstream-shape refactor (Phase C, WP GA-0001-05+06), so there's
-		// no longer AR-side state to clear when toggling modes.
+		// Reversal-mode config (reverse_on_next_month / reverse_date /
+		// reversal_*) and Copy-mode refresh switches (refresh_prices /
+		// recalculate_taxes / refresh_*_template / etc.) all moved off the
+		// AR doctype in the upstream-shape refactor (Phases C + D,
+		// WP GA-0001-05+06). The consuming app owns both via registered
+		// handlers, so there's no AR-side state to clear when toggling.
 		if (frm.doc.repeat_type === "Reversal") {
-			frm.set_value("refresh_mode", "Copy Original");
-			[
-				"refresh_prices",
-				"apply_pricing_rules",
-				"refresh_exchange_rate",
-				"recalculate_taxes",
-				"recalculate_payment_terms",
-				"refresh_sales_tax_template",
-				"refresh_purchase_tax_template",
-				"refresh_item_tax_template",
-				"refresh_shipping_rule",
-			].forEach((f) => frm.set_value(f, 0));
 			// frequency is not required in Reversal mode — clear stale value
 			frm.set_value("frequency", "");
-		}
-	},
-
-	refresh_mode: function (frm) {
-		// "Recalculate" auto-enables every individual switch; user can switch any off afterward.
-		if (frm.doc.repeat_type !== "Copy") return;
-		if (frm.doc.refresh_mode === "Recalculate") {
-			frm.set_value("refresh_prices", 1);
-			frm.set_value("refresh_exchange_rate", 1);
-			frm.set_value("recalculate_taxes", 1);
-			frm.set_value("recalculate_payment_terms", 1);
-			frm.set_value("respect_cost_center_allocation", 1);
-			frm.set_value("refresh_shipping_rule", 1);
-			frm.set_value("refresh_item_tax_template", 1);
-			// Sales/Purchase tax templates are doctype-scoped — only enable when applicable
-			const sales_doctypes = [
-				"Sales Invoice",
-				"Sales Order",
-				"Quotation",
-				"Delivery Note",
-			];
-			const purchase_doctypes = [
-				"Purchase Invoice",
-				"Purchase Order",
-				"Purchase Receipt",
-			];
-			if (sales_doctypes.includes(frm.doc.reference_doctype)) {
-				frm.set_value("refresh_sales_tax_template", 1);
-			}
-			if (purchase_doctypes.includes(frm.doc.reference_doctype)) {
-				frm.set_value("refresh_purchase_tax_template", 1);
-			}
 		}
 	},
 

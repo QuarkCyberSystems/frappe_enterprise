@@ -438,19 +438,24 @@ class TestAutoRepeat(IntegrationTestCase):
 		ar.set_dates()
 		self.assertEqual(getdate(ar.next_schedule_date), getdate(target))
 
-	def test_copy_mode_unchanged_when_refresh_switches_off(self):
-		"""Regression: with all refresh switches off, Copy mode behaves identically to today."""
+	def test_copy_mode_unchanged_for_non_erpnext_doctypes(self):
+		"""Regression: Copy mode behaves identically to original behavior
+		for non-ERPNext doctypes.
+
+		After Phase D of the upstream-shape refactor, refresh switches
+		(refresh_prices, recalculate_taxes, refresh_*_tax_template, etc.)
+		moved off the Auto Repeat doctype. Refresh behavior now lives in
+		each consuming app's `auto_repeat_copy_refresh_handlers` hook. For
+		framework-only doctypes (ToDo here), no handler is registered, so
+		Copy mode is a straight deep-copy — exactly like the original
+		pre-WP behavior.
+		"""
 		todo = frappe.get_doc(
 			doctype="ToDo", description="copy-mode regression test", assigned_by="Administrator"
 		).insert()
 		doc = make_auto_repeat(reference_document=todo.name)
-		# All new switches default off; refresh_mode default "Copy Original"
 		self.assertEqual(doc.repeat_type, "Copy")
-		self.assertEqual(doc.refresh_mode, "Copy Original")
-		self.assertEqual(doc.refresh_prices, 0)
-		self.assertEqual(doc.refresh_exchange_rate, 0)
-		self.assertEqual(doc.recalculate_taxes, 0)
-		# Should run as before
+		# Should run as before — straight copy
 		data = get_auto_repeat_entries(getdate(today()))
 		create_repeated_entries(data)
 		frappe.db.commit()
