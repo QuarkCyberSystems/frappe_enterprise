@@ -159,7 +159,7 @@ class AutoRepeat(Document):
 		validate_template(self.message or "")
 
 	def before_save(self):
-		self.warn_on_non_true_reversal()
+		pass
 
 	def before_insert(self):
 		if not frappe.in_test:
@@ -180,12 +180,12 @@ class AutoRepeat(Document):
 			return
 
 		if self.repeat_type == "Reversal":
-			# Reversal mode is single-execution; next_schedule_date is the configured reversal date
-			# so the existing scheduler dispatch path picks it up on the right day.
-			if self.reverse_on_next_month:
-				self.next_schedule_date = get_first_day(add_months(getdate(), 1))
-			elif self.reverse_date:
-				self.next_schedule_date = getdate(self.reverse_date)
+			# Reversal mode is single-execution; the consuming app sets
+			# start_date to the desired schedule date when creating the AR.
+			# Doctype-specific schedule semantics (e.g. JE's "First Day of
+			# Next Month" vs Specific Date) live in the registered handler,
+			# not here.
+			self.next_schedule_date = getdate(self.start_date)
 			return
 
 		self.next_schedule_date = self.get_next_schedule_date(schedule_date=self.start_date)
@@ -650,61 +650,22 @@ class AutoRepeat(Document):
 	# ──────────────────────────────────────────────────────────────────────
 
 	def validate_repeat_type(self):
-		if self.repeat_type != "Reversal":
-			return
+		"""Validate generic preconditions for `repeat_type`.
 
-		if self.reference_doctype != "Journal Entry":
-			frappe.throw(_("Reversal mode is only supported for Journal Entry"))
-
-		if not frappe.db.exists("DocType", "Journal Entry"):
-			# Frappe-only site without ERPNext — Reversal cannot work
-			frappe.throw(_("Reversal mode requires the ERPNext app (Journal Entry doctype not found)"))
-
-		if not (self.reverse_on_next_month or self.reverse_date):
-			frappe.throw(
-				_(
-					"Reversal mode requires either 'Reverse on First Day of Next Month' "
-					"or a specific 'Reversal Date'"
-				)
-			)
-
-	def warn_on_non_true_reversal(self):
-		"""Surface a warning when Reversal-mode settings break true-reversal semantics.
-
-		These choices are legitimate for adjustment scenarios (revaluation, restatement),
-		but break the perfect-offset property required for immutable-ledger compliance.
-		Warn — do not throw.
+		Doctype-specific validation (e.g. JE requiring a configured reversal
+		schedule) lives in the consuming app's auto_repeat_handlers entry —
+		that handler can raise before frappe schedules anything. Here we only
+		check that a handler is in fact registered for any non-Copy mode.
 		"""
-		if self.repeat_type != "Reversal":
+		if self.repeat_type in (None, "", "Copy"):
 			return
-		warnings = []
-		if self.reversal_exchange_rate_type == "Current Rate":
-			warnings.append(
-				_(
-					"Using 'Current Rate' for the reversal will create an FX gain/loss "
-					"instead of a perfect offset of the original entry."
-				)
-			)
-		if self.reversal_tax_mode == "Recalculate for Posting Date":
-			warnings.append(
-				_(
-					"Recalculating taxes on the reversal posting date breaks immutable-ledger "
-					"compliance for true reversals — only enable for adjustment scenarios."
-				)
-			)
-		if self.reversal_cost_center_mode == "Apply Current Allocation":
-			warnings.append(
-				_(
-					"Applying current Cost Center Allocation rules to the reversal breaks "
-					"immutable-ledger compliance for true reversals."
-				)
-			)
-		if warnings:
-			frappe.msgprint(
-				"<br>".join(warnings),
-				title=_("Reversal Configuration Warning"),
-				indicator="orange",
-			)
+
+		handler_path = self._resolve_repeat_handler()
+		if not handler_path:
+			frappe.throw(_(
+				"No Auto Repeat handler registered for repeat_type={0} on doctype {1}. "
+				"Add an entry to `auto_repeat_handlers` in your app's hooks.py."
+			).format(self.repeat_type, self.reference_doctype))
 
 	def get_authoritative_source(self):
 		"""Resolve the source document, following the amendment chain when configured.

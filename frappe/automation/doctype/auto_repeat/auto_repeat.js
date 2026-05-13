@@ -62,7 +62,10 @@ frappe.ui.form.on("Auto Repeat", {
 	},
 
 	repeat_type: function (frm) {
-		// Switching modes — reset the inverse mode's options to avoid stale state.
+		// Reversal-mode config (reverse_on_next_month, reverse_date,
+		// reversal_*) moved off the AR onto the source doctype in the
+		// upstream-shape refactor (Phase C, WP GA-0001-05+06), so there's
+		// no longer AR-side state to clear when toggling modes.
 		if (frm.doc.repeat_type === "Reversal") {
 			frm.set_value("refresh_mode", "Copy Original");
 			[
@@ -78,13 +81,6 @@ frappe.ui.form.on("Auto Repeat", {
 			].forEach((f) => frm.set_value(f, 0));
 			// frequency is not required in Reversal mode — clear stale value
 			frm.set_value("frequency", "");
-		} else {
-			frm.set_value("reverse_on_next_month", 0);
-			frm.set_value("reverse_date", null);
-			frm.set_value("auto_submit_reversal", 0);
-			frm.set_value("reversal_exchange_rate_type", "Original Rate");
-			frm.set_value("reversal_tax_mode", "Use Original");
-			frm.set_value("reversal_cost_center_mode", "Use Original");
 		}
 	},
 
@@ -117,12 +113,6 @@ frappe.ui.form.on("Auto Repeat", {
 			if (purchase_doctypes.includes(frm.doc.reference_doctype)) {
 				frm.set_value("refresh_purchase_tax_template", 1);
 			}
-		}
-	},
-
-	reverse_on_next_month: function (frm) {
-		if (frm.doc.reverse_on_next_month) {
-			frm.set_value("reverse_date", null);
 		}
 	},
 
@@ -188,11 +178,8 @@ frappe.auto_repeat.show_reversal_indicator = function (frm) {
 	} else if (frm.doc.disabled) {
 		label = __("Reversal Cancelled");
 		color = "grey";
-	} else if (frm.doc.reverse_on_next_month) {
-		label = __("Reversal Scheduled — First of Next Month");
-		color = "blue";
-	} else if (frm.doc.reverse_date) {
-		label = __("Reversal Scheduled — {0}", [frappe.datetime.str_to_user(frm.doc.reverse_date)]);
+	} else if (frm.doc.next_schedule_date) {
+		label = __("Reversal Scheduled — {0}", [frappe.datetime.str_to_user(frm.doc.next_schedule_date)]);
 		color = "blue";
 	} else {
 		label = __("Reversal Mode");

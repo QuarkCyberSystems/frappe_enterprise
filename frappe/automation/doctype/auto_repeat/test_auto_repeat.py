@@ -293,10 +293,17 @@ class TestAutoRepeat(IntegrationTestCase):
 		doc = make_auto_repeat(reference_document=todo.name)
 		self.assertEqual(doc.repeat_type, "Copy")
 
-	def test_validate_reversal_only_for_journal_entry(self):
-		"""TC-006: Reversal mode for non-JE doctype throws with the JE-only message."""
+	def test_validate_reversal_requires_handler(self):
+		"""TC-006 (post-refactor): Reversal mode requires a registered handler.
+
+		Previously frappe hardcoded `reference_doctype == "Journal Entry"`. After
+		the upstream-shape refactor, any doctype can opt-in by registering an
+		auto_repeat_handlers entry in its hooks.py — and frappe rejects a
+		Reversal-mode AR for any doctype without a handler. Test with a doctype
+		(ToDo) that is guaranteed not to have one.
+		"""
 		todo = frappe.get_doc(
-			doctype="ToDo", description="reversal-non-je test", assigned_by="Administrator"
+			doctype="ToDo", description="reversal-no-handler test", assigned_by="Administrator"
 		).insert()
 		ar = frappe.get_doc(
 			{
@@ -304,38 +311,19 @@ class TestAutoRepeat(IntegrationTestCase):
 				"reference_doctype": "ToDo",
 				"reference_document": todo.name,
 				"repeat_type": "Reversal",
-				"reverse_on_next_month": 1,
 				"start_date": today(),
 				"frequency": "",
 			}
 		)
-		with self.assertRaisesRegex(frappe.ValidationError, "Reversal mode is only supported"):
+		with self.assertRaisesRegex(
+			frappe.ValidationError, "No Auto Repeat handler registered"
+		):
 			ar.insert(ignore_permissions=True)
 
-	def test_validate_reversal_requires_schedule(self):
-		"""TC-024: Reversal mode requires either reverse_on_next_month or reverse_date."""
-		if not frappe.db.exists("DocType", "Journal Entry"):
-			self.skipTest("Journal Entry doctype not available — Frappe-only site")
-		# Create a real submitted JE to point at — but that requires ERPNext setup.
-		# Sidestep by using a custom test-doctype renamed to simulate the validation gate;
-		# the gate itself only checks reference_doctype string and the schedule flags.
-		ar = frappe.new_doc("Auto Repeat")
-		ar.update(
-			{
-				"reference_doctype": "Journal Entry",
-				"reference_document": "JE-DUMMY",
-				"repeat_type": "Reversal",
-				"reverse_on_next_month": 0,
-				"reverse_date": None,
-				"start_date": today(),
-				"frequency": "",
-			}
-		)
-		# validate_repeat_type runs before reference_document is dereferenced
-		with self.assertRaisesRegex(
-			frappe.ValidationError, "either 'Reverse on First Day of Next Month'"
-		):
-			ar.validate_repeat_type()
+	# test_validate_reversal_requires_schedule was removed in the upstream-
+	# shape refactor. The "you must specify a schedule" check is now the
+	# consuming app's concern — its handler can raise before frappe schedules
+	# anything. For ERPNext's JE handler, see TC-022/023 in the WP-05+06 ERPNext tests.
 
 	def test_skip_cancelled_source_no_amendment(self):
 		"""TC-001: Source cancelled, no amendment, skip_if_source_cancelled=1 → AR disabled."""
@@ -426,29 +414,14 @@ class TestAutoRepeat(IntegrationTestCase):
 		ar.reload()
 		self.assertIsNone(ar.get_authoritative_source())
 
-	def test_set_dates_reversal_first_of_next_month(self):
-		"""TC-005a: Reversal mode with reverse_on_next_month sets next_schedule_date to first of next month."""
-		if not frappe.db.exists("DocType", "Journal Entry"):
-			self.skipTest("Journal Entry doctype not available — Frappe-only site")
-		ar = frappe.new_doc("Auto Repeat")
-		ar.update(
-			{
-				"reference_doctype": "Journal Entry",
-				"reference_document": "JE-DUMMY",
-				"repeat_type": "Reversal",
-				"reverse_on_next_month": 1,
-				"start_date": today(),
-				"frequency": "",
-			}
-		)
-		ar.set_dates()
-		from frappe.utils import get_first_day
+	def test_set_dates_reversal_uses_start_date(self):
+		"""TC-005 (post-refactor): Reversal mode sets next_schedule_date = start_date.
 
-		expected = get_first_day(add_months(getdate(), 1))
-		self.assertEqual(getdate(ar.next_schedule_date), getdate(expected))
-
-	def test_set_dates_reversal_specific_date(self):
-		"""TC-005b: Reversal mode with reverse_date overrides reverse_on_next_month."""
+		Doctype-specific schedule semantics (JE's "First Day of Next Month" vs
+		Specific Date) are computed by the consuming app before AR creation;
+		the app passes the resolved date as `start_date`. Frappe's set_dates
+		then just propagates that to next_schedule_date for the cron to pick up.
+		"""
 		if not frappe.db.exists("DocType", "Journal Entry"):
 			self.skipTest("Journal Entry doctype not available — Frappe-only site")
 		target = add_days(today(), 14)
@@ -458,9 +431,7 @@ class TestAutoRepeat(IntegrationTestCase):
 				"reference_doctype": "Journal Entry",
 				"reference_document": "JE-DUMMY",
 				"repeat_type": "Reversal",
-				"reverse_on_next_month": 0,
-				"reverse_date": target,
-				"start_date": today(),
+				"start_date": target,
 				"frequency": "",
 			}
 		)

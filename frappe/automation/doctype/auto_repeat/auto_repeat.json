@@ -45,14 +45,6 @@
   "refresh_purchase_tax_template",
   "refresh_item_tax_template",
   "refresh_shipping_rule",
-  "reversal_section",
-  "reverse_on_next_month",
-  "reverse_date",
-  "column_break_reversal",
-  "auto_submit_reversal",
-  "reversal_exchange_rate_type",
-  "reversal_tax_mode",
-  "reversal_cost_center_mode",
   "notification",
   "notify_by_email",
   "recipients",
@@ -376,62 +368,6 @@
    "fieldname": "refresh_shipping_rule",
    "fieldtype": "Check",
    "label": "Refresh Shipping Rule"
-  },
-  {
-   "depends_on": "eval:doc.repeat_type == 'Reversal'",
-   "fieldname": "reversal_section",
-   "fieldtype": "Tab Break",
-   "label": "Reversal Options"
-  },
-  {
-   "default": "1",
-   "description": "Schedule the reversal for the first day of the month following today. Overrides Reversal Date when checked.",
-   "fieldname": "reverse_on_next_month",
-   "fieldtype": "Check",
-   "label": "Reverse on First Day of Next Month"
-  },
-  {
-   "depends_on": "eval:!doc.reverse_on_next_month",
-   "description": "Specific date on which the reversal should be created.",
-   "fieldname": "reverse_date",
-   "fieldtype": "Date",
-   "label": "Reversal Date",
-   "mandatory_depends_on": "eval:doc.repeat_type == 'Reversal' && !doc.reverse_on_next_month"
-  },
-  {
-   "fieldname": "column_break_reversal",
-   "fieldtype": "Column Break"
-  },
-  {
-   "default": "0",
-   "description": "Submit the generated reversal Journal Entry automatically. Leave off to create as draft for review.",
-   "fieldname": "auto_submit_reversal",
-   "fieldtype": "Check",
-   "label": "Auto Submit Reversal"
-  },
-  {
-   "default": "Original Rate",
-   "description": "Original Rate: perfect offset (recommended for immutable ledger). Current Rate: revalues using the FX rate at the reversal posting date — creates an FX gain/loss.",
-   "fieldname": "reversal_exchange_rate_type",
-   "fieldtype": "Select",
-   "label": "Exchange Rate for Reversal",
-   "options": "Original Rate\nCurrent Rate"
-  },
-  {
-   "default": "Use Original",
-   "description": "Use Original: reverse exact tax amounts (true reversal). Recalculate for Posting Date: log per-tax-account audit notes for review when current rates differ from the original.",
-   "fieldname": "reversal_tax_mode",
-   "fieldtype": "Select",
-   "label": "Reversal Tax Mode",
-   "options": "Use Original\nRecalculate for Posting Date"
-  },
-  {
-   "default": "Use Original",
-   "description": "Use Original: same cost centers as the source. Apply Current Allocation: audit cost-center rows against current Cost Center Allocation rules for the reversal date.",
-   "fieldname": "reversal_cost_center_mode",
-   "fieldtype": "Select",
-   "label": "Reversal Cost Center Mode",
-   "options": "Use Original\nApply Current Allocation"
   }
  ],
  "links": [],
